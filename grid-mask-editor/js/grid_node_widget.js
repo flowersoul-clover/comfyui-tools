@@ -130,12 +130,92 @@ function button(ctx, x, y, w, h, label, opt = {}) {
 
 const hit = (r, x, y) => !!r && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
 
+/* ───────────────── 数值健壮性（这一节是"NaN 疫情"的疫苗） ─────────────────
+ * 实测踩到（用户工作流 grid_node_to_masks_ui.json 直接复现）：
+ *   那个工作流存的是**旧版的 6 个 widgets_values**（第一位是已删掉的 `aspect`="自定义"）。
+ *   ComfyUI 按位置灌值 ⇒ `width` 拿到字符串 "自定义"、`regions` 拿到 "red 29 2 …"、
+ *   `background_file` 拿到 `true`，**整体错位一格**。
+ *   于是 `Number("自定义")/…` ⇒ NaN，而 **`Math.max(1, NaN)` 仍然是 NaN（不是 1！）**，
+ *   一路传染到 Math.round / ctx.fillText / computeSize() ⇒ 画布整块画不出来、
+ *   界面上写出 `NaN` 和 `NaN-768`。
+ *   ⇒ **每个数值入口都必须配 Number.isFinite 兜底**，只靠 Math.max/Math.round 夹取是不够的。
+ */
+const DEFAULT_W = 1216, DEFAULT_H = 704;
+const asFinite = (v, d) => {
+  if (typeof v === "number") return Number.isFinite(v) ? v : d;
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return d;
+};
+//: 夹取也要防 NaN/Infinity：非法 ⇒ 先取默认值，再夹
+const clampFinite = (v, lo, hi, d) => {
+  const n = asFinite(v, d);
+  return Math.min(hi, Math.max(lo, n));
+};
+//: 保证返回有限正整数（computeSize 的返回必须扛得住这个）
+const finiteInt = (v, d, lo, hi) => Math.max(lo, Math.round(clampFinite(v, lo, hi, d)));
+
+function widgetStore() {
+  try {
+    const S = globalThis.comfyAPI?.app?.widgets;
+    if (S) return S();
+  } catch (e) {}
+  return null;
+}
+
+/* ── 老格式工作流修正（关键：必须在 onConfigure **之前**跑，值才会正确落位） ──
+ * 实测：`grid_node_to_masks_ui.json` 存的是**旧版 widgets_values**，
+ * 多出一个已删除的 `aspect`（中文界面下是 "自定义"）⇒ 按位置灌值整体错位一格：
+ *   width="自定义" · height=1216 · cell=1536 · regions=<颜色格式串> · show_grid=<颜色格式串> · background_file=true
+ * 判据用**位置**（`info.widgets_values[0]` 是不是数值）—— 这是唯一可靠的信号：
+ * 正确格式下第一位一定是 `width`（INT）。命中后在原数组上**原地**把值改对，
+ * 这样无论后续按位置还是按名字落位，读到的都是好值。
+ * ⚠️ `regions` 必须清空而不是"向后挪一格"：挪过来的 `red 29 2 44 3`（格格式）会被新版
+ *    解析器当成"列起 行起 列止 行止" ⇒ 生成几千格、直接卡死；实测画一格就把它覆盖成
+ *    `red 0 0 1 1`，等于把用户原来画的图形整块丢掉。
+ * 正常数据一个字节都不动。 */
+function repairLegacyWidgets(nodeData, info, node) {
+  try {
+    if (nodeData?.name !== "GridMaskEditor") return;
+    const wv = info && info.widgets_values;
+    const S = widgetStore();
+    let vals = Array.isArray(wv) ? wv : (Array.isArray(node?.widgets) ? node.widgets.map((w) => w.value) : null);
+    if (!vals || vals[0] === undefined) return;
+    if (typeof vals[0] === "number") return;              //: 第一位是数值 ⇒ 格式正常
+    console.warn("[grid_node_widget] 检测到旧格式工作流（widget 值错位）；修正前 widgets_values =",
+      JSON.stringify(vals.slice(0, 6)) + (vals.length > 6 ? " …" : ""));
+    const fixed = { width: DEFAULT_W, height: DEFAULT_H, cell: DEFAULT_CELL, show_grid: true };
+    if (Array.isArray(wv)) {
+      //: 原地改对：这样后续无论按位置灌还是按名字灌，读到的都是好值
+      wv[0] = fixed.width; wv[1] = fixed.height; wv[2] = fixed.cell;
+      wv[3] = "";                                        //: regions：旧颜色格式，拿不准就清空
+      wv[4] = true;                                      //: show_grid
+      //: 剩下第 6 位本来该是 background_file；老数据里可能是 show_grid 被挤过来的 true ⇒ 清掉
+      if (typeof wv[5] !== "string") wv[5] = "";
+    }
+    const apply = (k, v) => {
+      const w = node && (node.widgets || []).find((x) => x.name === k);
+      if (w) w.value = v;
+      if (S) { try { S.setWidgetValue(nodeData.name, k, v); } catch (e) {} }
+    };
+    for (const k in fixed) apply(k, fixed[k]);
+    apply("regions", "");
+    apply("background_file", "");
+    console.warn("[grid_node_widget] 修正后：width/height/cell/show_grid 归位、regions 已清空（原值是旧颜色格式，无法安全转换）");
+  } catch (e) {
+    console.warn("[grid_node_widget] 旧格式修正失败（不影响加载）:", e && e.message);
+  }
+}
+
 /* ───────────────────── 单个 GridMaskEditor 节点的画布 ───────────────────── */
 
 function buildGridCanvasWidget(node) {
   /* ── widget 取值/写值：与 nodes.py 的 width / height / cell / background_file / regions 打通 ── */
   const find = (k) => (node.widgets || []).find((w) => w.name === k);
-  const W = (k, d) => { const w = find(k); return w && w.value != null && w.value !== "" ? Number(w.value) : d; };
+  //: ⚠️ 读值必须过 asFinite：老工作流错位后这里可能是 "自定义" / true / undefined
+  const W = (k, d) => { const w = find(k); return w ? asFinite(w.value, d) : d; };
   const setWidget = (k, v) => {
     const w = find(k); if (!w) return;
     w.value = v;
@@ -161,21 +241,39 @@ function buildGridCanvasWidget(node) {
 
   /* ── 网格几何：cols/rows 由 width/height/cell 决定（下面多处要用，先定义） ── */
   function grid() {
-    const w = W("width", 1216), h = W("height", 704);
-    const cell = Math.max(4, W("cell", DEFAULT_CELL));
+    const w = W("width", DEFAULT_W), h = W("height", DEFAULT_H);
+    const cell = W("cell", DEFAULT_CELL);
     return {
-      cols: Math.max(1, Math.round(w / cell)),
-      rows: Math.max(1, Math.round(h / cell)),
+      cols: finiteInt(w / cell, DEFAULT_W / DEFAULT_CELL, 1, 8192),   //: 除法会带 NaN 进来
+      rows: finiteInt(h / cell, DEFAULT_H / DEFAULT_CELL, 1, 8192),
     };
   }
   const syncGrid = () => { const g = grid(); state.cols = g.cols; state.rows = g.rows; };
-  const cellPx = () => Math.max(4, W("cell", DEFAULT_CELL));
+  const cellPx = () => finiteInt(W("cell", DEFAULT_CELL), DEFAULT_CELL, 4, 4096);
   //: 画布高度按宽高比，但有上限（竖图别把节点撑爆）
   const canvasH = () => {
     const c = grid();
-    return Math.max(48, Math.min(MAX_CANVAS_H, Math.round(BASE_W * c.rows / c.cols)));
+    return finiteInt(BASE_W * c.rows / c.cols, BASE_W * DEFAULT_H / DEFAULT_W, 48, MAX_CANVAS_H);
   };
-  const contentH = () => SWATCH_H + RES_H + BTN_H + canvasH() + INFO_H + ROW_GAP * 4 + 6;
+  //: ⚠️ computeSize() 直接吃这个 ⇒ 必须保证是有限正整数
+  const contentH = () => finiteInt(
+    SWATCH_H + RES_H + BTN_H + canvasH() + INFO_H + ROW_GAP * 4 + 6, 430, 64, 4096);
+
+  /* ── 自愈：老工作流按位置灌错值 ⇒ 把坏掉的数值 widget 归位 ──
+   * 只在"确实不是有限数"时才写，绝不覆盖合法值。不这么做的话画布虽然能画了，
+   * 但用户一保存工作流，坏值还会被写回去（等于没修）。 */
+  function healNumericWidgets() {
+    const rules = [["width", DEFAULT_W, 64, 4096], ["height", DEFAULT_H, 64, 4096], ["cell", DEFAULT_CELL, 8, 512]];
+    const bad = [];
+    for (const [k, d, lo, hi] of rules) {
+      const w = find(k); if (!w) continue;
+      if (!Number.isFinite(Number(w.value))) {        //: Number("自定义") / Number(true) ⇒ NaN
+        w.value = finiteInt(d, d, lo, hi);
+        bad.push(k);
+      }
+    }
+    if (bad.length) console.warn("[grid_node_widget] 工作流里的数值 widget 坏了，已按默认值修复：", bad.join(", "));
+  }
 
   /* ── 撤销：**一次连续拖动 = 一步**（按下时入栈，拖动过程中不再入） ── */
   const undoStack = [];
@@ -323,7 +421,9 @@ function buildGridCanvasWidget(node) {
   /* ─────────────────────────── 绘制 ─────────────────────────── */
 
   function layout(width) {
-    const w = Math.max(160, Math.round(width || BASE_W));
+    //: ⚠️ width 也可能是 NaN（litegraph 在渲染尺寸没算好时会传进来），
+    //:    而 NaN||BASE_W 仍然是 NaN ⇒ 必须走 asFinite
+    const w = finiteInt(width, BASE_W, 160, 4096);
     const ch = canvasH();
     const top = 2;
     const ySwatch = top;
@@ -361,7 +461,7 @@ function buildGridCanvasWidget(node) {
     }
     state.hits.aspect = [];
     for (const [lab, w, hh] of ASPECTS) {   //: 宽高预设（只改 width/height）
-      const active = Math.round(W("width", 1216)) === w && Math.round(W("height", 704)) === hh;
+      const active = Math.round(W("width", DEFAULT_W)) === w && Math.round(W("height", DEFAULT_H)) === hh;
       const r = button(ctx, x, L.yRes + 2, 34, h, lab, { active });
       state.hits.aspect.push({ w, h: hh, rect: r });
       x += 34 + 3;
@@ -376,7 +476,7 @@ function buildGridCanvasWidget(node) {
     state.hits.actions.undo = button(ctx, x, y, 40, h, "撤销", { active: undoStack.length > 0 }); x += 40 + 3;
     state.hits.actions.clear = button(ctx, x, y, 40, h, "清空"); x += 40 + 3;
     state.hits.actions.regions = button(ctx, x, y, 66, h, "regions文本");
-    const dim = `${Math.round(W("width", 1216))}×${Math.round(W("height", 704))}`;
+    const dim = `${finiteInt(W("width", DEFAULT_W), DEFAULT_W, 1, 100000)}×${finiteInt(W("height", DEFAULT_H), DEFAULT_H, 1, 100000)}`;
     ctx.save();
     ctx.font = "10px system-ui"; ctx.textAlign = "right"; ctx.textBaseline = "middle";
     ctx.fillStyle = "#8cf";
@@ -400,7 +500,7 @@ function buildGridCanvasWidget(node) {
     }
     //: ⭐ 先画格线、**再**画色块 ⇒ 色块上不会被打出 1px 洞（洞会让 mask 出现缝）
     //:   且格线颜色全部 < 127（阈值 0.5×255）⇒ 不会被 MaskFromRGBCMYBW+ 判成 white 那档
-    const boldEvery = Math.max(1, Math.round(64 / Math.max(1, cw)));   //: 格越细粗线间隔自动放大
+    const boldEvery = finiteInt(64 / Math.max(0.5, asFinite(cw, 64)), 1, 1, 10000);   //: 格越细粗线间隔自动放大
     ctx.lineWidth = 1;
     for (let c = 1; c < cols; c++) {
       const x = Math.round(x0 + c * cw) + 0.5;
@@ -455,7 +555,6 @@ function buildGridCanvasWidget(node) {
   function draw(ctx, n, width) {
     if (!ctx) return 0;
     const L = layout(width);
-    L.w = Math.max(160, Math.round(width || BASE_W));
     L.canvasW = L.w - 4;
     state.layout = L;
     state.ctx = ctx;
@@ -636,7 +735,7 @@ function buildGridCanvasWidget(node) {
   //:    这里只做"引用不同就加个变化标记"的廉价判断（ComfyUI 的 STORE 换值必然换引用），
   //:    真正解析文本的 pull() 只在签名真的变了时才跑。
   let lastSig = "", regionsSeen = null, regionsDirty = false;
-  const sig = () => [W("width", 1216), W("height", 704), W("cell", DEFAULT_CELL),
+  const sig = () => [W("width", DEFAULT_W), W("height", DEFAULT_H), W("cell", DEFAULT_CELL),
                      String(W("background_file", "") || ""), regionsDirty].join("|");
   const oldFg = node.onDrawForeground;
   node.onDrawForeground = function (ctx) {
@@ -666,7 +765,17 @@ function buildGridCanvasWidget(node) {
   };
 
   /* ── 初始化 ── */
+  //: ⚠️ 顺序很重要：**先自愈坏值**，再算几何/画第一次。
+  //:    实测老工作流里 width="自定义"、cell=1536 这种坏值，若不自愈，
+  //:    NaN 会一路传到 computeSize()，画布整块画不出来。
+  healNumericWidgets();
   syncGrid();
+  //: 节点尺寸兜底：老工作流里可能是 [560, null]（NaN 被 JSON 成了 null），
+  //: null 尺寸会让 litegraph 的布局出 NaN。只在明显不合法时才动。
+  if (!Array.isArray(node.size) || !Number.isFinite(node.size[0]) || !Number.isFinite(node.size[1])
+      || node.size[0] < 200 || node.size[1] < 200) {
+    node.size = [BASE_W, Math.max(320, contentH() + 120)];
+  }
   const nm0 = String(W("background_file", "") || "");
   if (nm0) loadBg(nm0);
   state.cells = cellsFromText(getRegionsText(), state.cols, state.rows);
@@ -680,6 +789,21 @@ function buildGridCanvasWidget(node) {
 
 app.registerExtension({
   name: "grid.mask.editor.node",
+  async beforeRegisterNodeDef(nodeType, nodeData) {
+    if (nodeData?.name !== "GridMaskEditor") return;
+    try {
+      /* ⚠️ 时机坑（实测）：`nodeCreated` 跑在 `onConfigure` **之前**，
+       * 那时 widget 还是默认值，读不到老工作流存进来的坏值 —— 所以自愈不能只放在 nodeCreated。
+       * 这里挂一个 onConfigure 前置钩子，在 ComfyUI 把老值灌下去**之前**先修正。 */
+      const orig = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function (info) {
+        try { repairLegacyWidgets(nodeData, info, this); } catch (e) {}
+        return orig ? orig.apply(this, arguments) : undefined;
+      };
+    } catch (e) {
+      console.warn("[grid_node_widget] onConfigure 钩子挂载失败（不影响加载）:", e && e.message);
+    }
+  },
   async nodeCreated(node) {
     if (node.comfyClass !== "GridMaskEditor") return;
     try {
