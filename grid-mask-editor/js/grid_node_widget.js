@@ -62,7 +62,7 @@ const RES_H = 18;         //: 分辨率 + 宽高预设行
 const BTN_H = 18;         //: 功能按钮行
 const ROW_GAP = 2;
 const INFO_H = 26;        //: 状态行（两行小字）
-const MAX_CANVAS_H = 420; //: 画布高度上限（竖图时别把节点撑到天上去）
+const MAX_CANVAS_H = 1600; //: 画布高度上限（节点已固定 2048 高 ⇒ 放开，让画布随可用高度长）
 
 /* ───────────────────── 纯数据层：regions ⇄ cells ───────────────────── */
 /* regions 是**唯一真源**；cells 只是它的可视化解码。 */
@@ -243,6 +243,14 @@ function buildGridCanvasWidget(node) {
   };
   //: 最近一次真实绘制用的宽度（0 = 还没画过）。computeSize 与它共用 ⇒ 声明宽度==绘制宽度
   let lastDrawnW = 0;
+  /* ⚠️ 唯一的宽度来源（2026-10-13 实测踩坑）：以前 layout()/hitCanvas()/computeSize() 都用
+   * `lastDrawnW`（litegraph 传给 draw() 的宽度），而它会被某次"窄宽 draw"写成小值（实测 241，
+   * 节点明明 2048）⇒ 命中判断以为点在画布外 ⇒ 点击全部失效。**行宽本来就等于节点宽**，
+   * 所以以 node.size[0] 为准，lastDrawnW 只作兜底。 */
+  const widthSource = () => {
+    const nw = Number((node && node.size && node.size[0]) || 0);
+    return Math.max(MIN_W, nw || 0, lastDrawnW || 0);
+  };
   let lastDrawArgs = null;      //: 最近一次 draw 收到的 (width, y, height) 与我们的总高
   /* ── 垂直原点对齐（实测踩到的大坑） ──
    * graph-canvas 那条渲染路径里，litegraph 会把 widget 的绘制上下文**再整体上移一个
@@ -272,7 +280,7 @@ function buildGridCanvasWidget(node) {
   //:    高度取决于**实际渲染了几行**（窄节点会多一行操作区），所以按 layout() 的结果累计，
   //:    不能写死 5 行的常量 —— 否则窄节点会溢出/叠行。
   const contentNaturalH = () => {
-    try { return layout(lastDrawnW || BASE_W, 0, Infinity, Infinity).total; }
+    try { return layout(widthSource()).total; }
     catch (e) { return 600; }
   };
   /* ⭐ 报给 litegraph 的高度 = **从节点顶算起的绝对总高**
@@ -284,9 +292,8 @@ function buildGridCanvasWidget(node) {
    *    同一份 layout() 既用于绘制也用于报高度 ⇒ 两者天然一致。 */
   const contentH = () => {
     try {
-      const w = find("grid_canvas");
-      const wy = Number.isFinite(w && w.y) && w.y > 0 ? Math.round(w.y) : 0;
-      return finiteInt(wy + layout(lastDrawnW || BASE_W, wy, Infinity, Infinity).total, 64, 64, 16384);
+      const L = layout(widthSource());
+      return finiteInt(L.total, 64, 64, 16384);
     } catch (e) { return finiteInt(64 + contentNaturalH(), 64, 64, 16384); }
   };
 
@@ -452,152 +459,31 @@ function buildGridCanvasWidget(node) {
 
   /* ─────────────────────────── 绘制 ─────────────────────────── */
 
-  /* ── 布局（宽度自适应版） ──
-   * ⚠️ 实测踩到：早期版本三行控件**写死 599px 宽**，与节点实际宽度无关 ⇒
-   *    - 节点比 599 窄时，色板/档位/预设会**画到节点外面**（用户看到的"挤在右侧、和画布并排/重叠"）；
-   *    - 节点比 599 宽时，`1216×704` 这类靠右对齐的字跑到画布外。
-   * 修法：**一切从实际可用宽度 `w` 出发**，按"整块（块1 色板 / 块2 档位+预设 / 块3 操作）依次排"，
-   * 放不下就换行；块1 放不下才退化到"单色板 + 省掉块5"。
-   * 同时用同一个 `w` 去算 `computeSize`，保证"声明宽度 == 绘制宽度"。 */
-  function layout(width, y0, availH, drawH) {
-    //: ⚠️ width 也可能是 NaN（litegraph 渲染尺寸没算好时会传进来），
-    //:    而 NaN||BASE_W 仍然是 NaN ⇒ 必须走 asFinite
-    const avail = finiteInt(width, BASE_W, MIN_W, 4096);
-    //: ⭐ 画布顶部锚定：**从 litegraph 给的 y 开始**排（控件在上、画布紧跟、状态行最后）。
-    //:    （用户 2026-10-13 找到的根因：之前用自己假设的原点，声明高度又比实际画的小。）
-    const top = finiteInt(y0, 0, 0, 8192);
-    //: 这一行能用的高度：litegraph 分配的 drawH，以及节点体剩下多少（两者取小，再留一点）
-    const budget = (Number.isFinite(availH) && availH > 0)
-      ? Math.max(24, Math.floor(availH) - top - 2)
-      : Infinity;
-    //: 状态行放不下就**宁可裁掉它**，绝不让画布溢出行外（用户明确要求）
-    const needInfo = INFO_H + ROW_GAP;
-    const ch = Math.max(24, Math.min(canvasH(), budget - (SWATCH_H + RES_H + BTN_H + ROW_GAP * 3 + needInfo)));
-    const showInfo = budget === Infinity || (SWATCH_H + RES_H + BTN_H + ROW_GAP * 3 + ch + needInfo) <= budget;
-    const pad = 2;
-    const gap = 3;
-    const wCv = Math.max(80, avail - 4);
+  /* ── 新架构（用户 2026-10-14 定）：**控件行全部是 litegraph 原生 widget**，
+   *    自定义 widget 只画"画布"这一行、并且加在最后 ⇒ 输入行天然在它上面、永不重叠。
+   *    所以这里**不再有任何色板/档位/预设/按钮的绘制与命中矩形**，也就不再需要
+   *    "自己算偏移、怕盖住别人"的那一堆逻辑。 */
+  const canvasHNow = () => {
+    const c = grid();
+    return finiteInt(BASE_W * c.rows / c.cols, BASE_W * DEFAULT_H / DEFAULT_W, 48, MAX_CANVAS_H);
+  };
 
-    //: 块尺寸（与真实按钮宽度逐字一致）
-    const BW = { sw: 46, res: 36, asp: 34, upload: 58, undo: 40, clear: 40, reg: 66 };
-    const blockSw = COLORS.length * (BW.sw + gap) - gap;                        //: 色板
-    const blockRes = STEPS.length * (BW.res + gap) - gap;                       //: 档位
-    const blockAsp = ASPECTS.length * (BW.asp + gap) - gap;                     //: 预设
-    const blockAct = BW.upload + gap + BW.undo + gap + BW.clear + gap + BW.reg; //: 操作
-
-    //: 从可用宽度里扣掉"块5（右端尺寸字 + 状态行第二段）"需要的固定位置
-    const dimText = `${finiteInt(W("width", DEFAULT_W), DEFAULT_W, 1, 100000)}×` +
-                    `${finiteInt(W("height", DEFAULT_H), DEFAULT_H, 1, 100000)}`;
-    const right0 = 54;
-    let x = pad;
-    const rows = [];
-
-    //: 第1行：色板（永远在最左，不参与换行顺序）
-    //: ⚠️ 这里**必须给 x0**：上一版漏了 ⇒ 画色板时 x 从 undefined 起算，
-    //:    第一个色块就落到 NaN 上，整行色板全画不出来（浏览器实测整行消失）。
-    rows.push({ items: COLORS.map((c) => ({ label: c, c })), key: "swatch", h: SWATCH_H, x0: pad });
-    x = pad + blockSw + gap;
-    //: 第2行：档位 + 预设（整块搬，"9:16" 不会被拆散）
-    let row2 = [];
-    if (x + blockRes <= avail - 4) {
-      row2 = STEPS.map((px) => ({ label: px + "px", px }));
-      x += blockRes + gap;
-      if (x + blockAsp <= avail - 4) { row2 = row2.concat(ASPECTS.map(([l]) => ({ label: l, aspect: l }))); x += blockAsp + gap; }
-    }
-    rows.push({ items: row2, key: "res", h: RES_H, x0: pad + blockSw + gap });
-    //: 第3行：操作（整块）＋ 右端尺寸字
-    const actRow = [];
-    if (x + blockAct <= avail - 4 - right0) {
-      actRow.push({ label: "上传底图", act: "upload", w: BW.upload });
-      actRow.push({ label: "撤销", act: "undo", w: BW.undo });
-      actRow.push({ label: "清空", act: "clear", w: BW.clear });
-      actRow.push({ label: "regions文本", act: "regions", w: BW.reg });
-    } else {
-      //: 太窄：换到第4行（整行给操作），还放不下就只留最关键的两个
-      if (blockAct + right0 <= avail - pad * 2) {
-        actRow.push({ label: "上传底图", act: "upload", w: BW.upload });
-        actRow.push({ label: "撤销", act: "undo", w: BW.undo });
-        actRow.push({ label: "清空", act: "clear", w: BW.clear });
-        actRow.push({ label: "regions", act: "regions", w: 50 });
-      } else {
-        actRow.push({ label: "上传", act: "upload", w: 36 });
-        actRow.push({ label: "撤销", act: "undo", w: 36 });
-        actRow.push({ label: "清空", act: "clear", w: 36 });
-      }
-    }
-    rows.push({ items: actRow, key: "actions", h: BTN_H, x0: pad, rightText: dimText });
-
-    //: ⚠️ 只用**一套** y 坐标（= 绘制坐标，节点内）：鼠标事件、命中矩形、画出来的东西共用它
-    let cy = top + 2;
-    const yOf = {};
-    for (const r of rows) { r.y = cy; yOf[r.key] = cy; cy += r.h + ROW_GAP; }
-    const yCv = cy;
+  /* ⚠️ `total` 是**纯行高**（这一行自己有多高），**不含**任何绝对 y。
+   *    litegraph 只把 `computeSize()[1]` 当行高用（行顶 y 由它自己累加），
+   *    所以这里绝不能把 y0 混进 total（上一版混了 ⇒ 三个数对不上）。 */
+  function layout(width) {
+    const w = finiteInt(width, BASE_W, 160, 8192);
+    //: 画布高度：剩下的空间都给画布（节点 2048 高 ⇒ 画布随高度长）
+    const room = Math.max(64, canvasRoomH() - 2 - INFO_H - ROW_GAP);
+    const ch = finiteInt(Math.max(canvasHNow(), room), 200, 48, MAX_CANVAS_H);
+    const yCv = 2;                                   //: **行内**坐标（行顶 = 0）
     const yInfo = yCv + ch + ROW_GAP;
-    //: ⭐ 总高**精确等于实际绘制的高度**（用户要求：一像素都不许少），
-    //:    `computeSize()` 直接回这个数 ⇒ 声明高度 == 绘制高度。
-    const total = yInfo + (showInfo ? INFO_H : 0) + 2;
     return {
-      w: avail, ch, canvasW: wCv, x0: pad, y0: top,
-      ySwatch: yOf.swatch, yRes: yOf.res, yBtn: yOf.actions, yCv, yInfo,
-      rows, blockGap: gap, BW, showInfo, total,
+      w, ch, canvasW: Math.max(80, w - 4), x0: 2, y0: 0,
+      yCv, yInfo, yCvFrame: yCv, yInfoFrame: yInfo, drawOff: 0,
+      rows: [], blockGap: 3, BW: {}, showInfo: true,
+      total: yInfo + INFO_H + 2,
     };
-  }
-
-  /* ── 三行控件按 L.rows 的排布来画（宽度自适应，且**命中矩形与画出来的一定一致**） ── */
-  function drawPalette(ctx, L) {
-    const h = SWATCH_H - 4, gap = L.blockGap, sw = L.BW.sw;
-    state.hits.swatch = {};
-    const row = L.rows.find((r) => r.key === "swatch");
-    let x = row ? row.x0 : 2;
-    for (const c of COLORS) {
-      const r = button(ctx, x, row.y + 2, sw, h, c, {
-        active: c === state.active, bg: RGB[c],
-        fg: (c === "black" || c === "blue" || c === "magenta") ? "#fff" : "#000",
-        font: "9px system-ui",
-      });
-      state.hits.swatch[c] = r;
-      x += sw + gap;
-    }
-  }
-
-  function drawResAndAspect(ctx, L) {
-    const h = RES_H - 4, gap = L.blockGap;
-    state.hits.res = []; state.hits.aspect = [];
-    const row = L.rows.find((r) => r.key === "res");
-    if (!row) return;
-    let x = row.x0 || 2;
-    const put = (item) => {
-      let w = 0, active = false;
-      if (item.px !== undefined) { w = L.BW.res; active = item.px === cellPx(); }
-      else {
-        const a = ASPECTS.find(([l]) => l === item.aspect);
-        w = L.BW.asp;
-        active = a ? (Math.round(W("width", DEFAULT_W)) === a[1] && Math.round(W("height", DEFAULT_H)) === a[2]) : false;
-      }
-      const r = button(ctx, x, row.y + 2, w, h, item.label, { active });
-      if (item.px !== undefined) state.hits.res.push({ px: item.px, rect: r });
-      else { const a = ASPECTS.find(([l]) => l === item.aspect); if (a) state.hits.aspect.push({ w: a[1], h: a[2], rect: r }); }
-      x += w + gap;
-    };
-    row.items.forEach(put);
-  }
-
-  function drawActions(ctx, L) {
-    const h = BTN_H - 4, gap = L.blockGap, y = L.yBtn + 2;
-    state.hits.actions = {};
-    const row = L.rows.find((r) => r.key === "actions");
-    let x = row ? (row.x0 || 2) : 2;
-    for (const it of (row ? row.items : [])) {
-      const r = button(ctx, x, y, it.w, h, it.label, { active: it.act === "undo" && undoStack.length > 0 });
-      state.hits.actions[it.act] = r;
-      x += it.w + gap;
-    }
-    const dim = `${finiteInt(W("width", DEFAULT_W), DEFAULT_W, 1, 100000)}×${finiteInt(W("height", DEFAULT_H), DEFAULT_H, 1, 100000)}`;
-    ctx.save();
-    ctx.font = "10px system-ui"; ctx.textAlign = "right"; ctx.textBaseline = "middle";
-    ctx.fillStyle = "#8cf";
-    ctx.fillText(dim, L.w - 6, y + h / 2);
-    ctx.restore();
   }
 
   function drawGrid(ctx, L) {
@@ -672,33 +558,20 @@ function buildGridCanvasWidget(node) {
   //: 真正的绘制入口。两条调用路径（见文件头注释）只共享 width 是可信的。
   function draw(ctx, n, width, y, drawH) {
     if (!ctx) return 0;
-    //: ⭐ 顶部锚定：litegraph 给的 y 就是这一行的起点（老式 canvas widget 会传第 4 个参数）。
-    //:    Vue 那条路径传的是固定值 1，也是有效起点。
-    //: 高度预算：
-    //: ⚠️ 老式 canvas widget 这条路径里，litegraph 传进来的 `height` 是 **NODE_WIDGET_HEIGHT(=20)**，
-    //:    不是"分配给我们的行高"——实测照它裁会把画布压成 24px（白区只剩 23px 高）。
-    //:    所以预算只取**节点体高**（bodyHeight），并保证不小于我们需要的自然高。
+    //: ⭐ 这一行**只有画布**（控件都是原生 widget 了）⇒ 直接按 litegraph 给的 y/width 画，
+    //:    不做任何自身偏移（上一版那 146px 的偏移问题从此不存在）。
+    //: `y` 只用来记录/诊断；画的时候从行内 0 起（ctx 已被 litegraph 移到这一行），
+    //: **绝不把 y 加进 total**（total 是纯行高）。
     const yTop = Number.isFinite(y) && y >= 0 ? Math.round(y) : 0;
-    const availH = Math.max(contentNaturalH(), bodyRoomFrom());
-    const L = layout(width, yTop, availH, drawH);
-    //: ⚠️ 记下"真实可用宽度"，computeSize 要用**同一个值**（同一值 ⇒ 不会溢出/叠行）
+    const L = layout(width);
     lastDrawnW = L.w;
-    lastDrawArgs = { width: L.w, y: yTop, height: drawH, total: L.total, availH: availH };
-    //: ⚠️ 只有**主画布**的 ctx 才更新"交互用的 layout/ctx"。
-    //:    小地图(minimap)之类会拿同一个 widget 在别的 canvas 上再画一遍，若用它的 ctx
-    //:    覆盖 state.ctx，重绘就会画错地方/命中框跟着错位（实测点击时灵时不灵的真凶之一）。
-    let isMain = true;
-    try { isMain = !!(app.canvas && ctx === app.canvas.ctx); } catch (e) { isMain = true; }
-    if (isMain) { state.layout = L; state.ctx = ctx; }
+    lastDrawArgs = { width: L.w, y: yTop, height: drawH, total: L.total };
+    state.layout = L;
+    state.ctx = ctx;
     ctx.save();
-    //: 兜底裁剪：即使某行算错，也绝不画到节点外面去（用户看到的就是"不重叠"）
-    ctx.beginPath(); ctx.rect(0, 0, L.w, L.total); ctx.clip();
+    ctx.beginPath(); ctx.rect(0, 0, L.w, L.total); ctx.clip();   //: 只在分配给我们的行内绘制
     ctx.fillStyle = "#1e1e22";
     ctx.fillRect(0, 0, L.w, L.total);
-
-    drawPalette(ctx, L);
-    drawResAndAspect(ctx, L);
-    drawActions(ctx, L);
     drawGrid(ctx, L);
     drawInfo(ctx, L);
     ctx.restore();
@@ -720,37 +593,31 @@ function buildGridCanvasWidget(node) {
   }
 
   /* ── 画布坐标 → 格 ── */
-  function cellAt(x, yNodeLocal) {
-    ensureLayout();
-    const L = state.layout; if (!L) return null;
-    //: 事件与 hits 矩形都在**节点内**坐标（frame）空间 ⇒ 这里不做任何换算
-    const y = yNodeLocal;
-    if (y < L.yCv || y > L.yCv + L.ch || x < 2 || x > L.canvasW + 2) return null;
-    const c = Math.floor((x - 2) / (L.canvasW / state.cols));
-    const r = Math.floor((y - L.yCv) / (L.ch / state.rows));
-    if (c < 0 || c >= state.cols || r < 0 || r >= state.rows) return null;
-    return { c, r };
-  }
+  function cellAt(x, yNodeLocal) { return hitCanvas(x, yNodeLocal); }
 
   //: ⚠️ 实测踩到：**页面刚加载、还没触发过一次 draw 时 layout 是 null**，
   //:    此时点画布会静默无反应（用户看到的就是"点不动"）。所以鼠标入口必须能自算布局。
   function ensureLayout() {
     if (state.layout) return state.layout;
     //: 兜底也**锚定在 litegraph 给出的行起点**（widget.y），不自己假设原点
-    const w = find("grid_canvas");
-    const wy = Number.isFinite(w && w.y) && w.y >= 0 ? Math.round(w.y) : 0;
-    const L = layout(BASE_W, wy, bodyRoomFrom(), Infinity);
+    const L = layout(BASE_W);
     state.layout = L;
     return L;
   }
 
   /* ⭐ 命中判断专用：**每次都用 widget.y 现算一份 layout**，绝不信任可能过期的缓存。
    * 缓存里的 y0 可能是别的行起点/aarrange 中间态，导致"点上去落进了 width/height 那些行"。 */
-  function freshLayoutForHit() {
+  //: 这一行在节点内的起点（= litegraph 给我们的 y；用 widget.y，稳定值优先 last_y）
+  function widgetY() {
     const w = find("grid_canvas");
-    const wy = Number.isFinite(w && w.y) && w.y >= 0 ? Math.round(w.y) : 0;
-    //: 只用于命中，不改写 state.layout（避免破坏绘制用的那一份）
-    return layout(lastDrawnW || BASE_W, wy, bodyRoomFrom(), Infinity);
+    if (!w) return 0;
+    const y = (w.last_y !== undefined && w.last_y !== null) ? w.last_y : w.y;
+    return Number.isFinite(y) && y >= 0 ? Math.round(y) : 0;
+  }
+
+  function freshLayoutForHit() {
+    //: 只用于命中，不改写 state.layout
+    return layout(widthSource());
   }
 
   //: 节点体还剩下多少高度可用（y 之上已经占掉的部分不算）——用于"宁裁状态行也别溢出行外"
@@ -766,14 +633,33 @@ function buildGridCanvasWidget(node) {
    * litegraph 的 widget 命中测试与我们的绘制位置实测差 84~146px（且 widget.y 会瞬变 0），
    * 所以改用**节点级鼠标事件**（node.onMouseDown/Move/Up，pos 就是节点内坐标），
    * 命中判断完全由下面的矩形决定。 */
+  /* 行顶/行高**全部来自 litegraph 自己**（不再自己算任何 fudge 偏移）：
+   *   行顶 = widget.last_y（= drawWidgets 写回的 y，也是 getWidgetOnPos 用的那个）
+   *   行高 = widget.computedHeight（= _arrangeWidgets 用我们 computeSize()[1] 写的）
+   * 事件 pos 是**节点内**坐标 ⇒ 直接用 [行顶, 行顶+行高] 判，命中后再换成行内坐标算格子。 */
+  function rowTop() {
+    const w = find("grid_canvas");
+    if (!w) return 0;
+    const y = (w.last_y !== undefined && w.last_y !== null) ? w.last_y : w.y;
+    return Number.isFinite(y) && y >= 0 ? Math.round(y) : 0;
+  }
+  function rowH() {
+    const w = find("grid_canvas");
+    const h = Number(w && w.computedHeight);
+    if (Number.isFinite(h) && h > 0) return Math.round(h);
+    return contentH();
+  }
+
   function hitCanvas(x, yNodeLocal) {
     const L = freshLayoutForHit();
     if (!L) return null;
-    //: 命中矩形 = state.layout 里的画布区（与 draw 的坐标同一套）
-    if (yNodeLocal < L.yCv || yNodeLocal > L.yCv + L.ch) return null;
+    const top = rowTop(), H = rowH();
+    if (yNodeLocal < top || yNodeLocal > top + H) return null;   //: 用 litegraph 的行顶/行高
+    const y = yNodeLocal - top;                                  //: 行内坐标
+    if (y < L.yCv || y > L.yCv + L.ch) return null;
     if (x < 2 || x > L.canvasW + 2) return null;
     const c = Math.floor((x - 2) / (L.canvasW / state.cols));
-    const r = Math.floor((yNodeLocal - L.yCv) / (L.ch / state.rows));
+    const r = Math.floor((y - L.yCv) / (L.ch / state.rows));
     if (c < 0 || c >= state.cols || r < 0 || r >= state.rows) return null;
     return { c, r };
   }
@@ -896,10 +782,51 @@ function buildGridCanvasWidget(node) {
     //:    否则"声明 560、实画 599" ⇒ 溢出/与别的 widget 行叠在一起（用户实测踩到）。
     //:    高度只取决于**格子数**（与宽度无关）⇒ 不存在"变宽就重算高度"的抖动。
     //:    `MIN_W` 是保守下限：比它还窄时把节点撑到这个宽度，保证三行控件放得下。
-    computeSize: () => [Math.max(MIN_W, lastDrawnW || MIN_W), contentH()],
+    //: ⭐ 声明高度 == 这一行**实际绘制**的总高（同一份 layout() 算出来的，不再二次夹取）
+    computeSize: () => {
+      const w = widthSource();
+      return [w, layout(w).total];
+    },
     onRemove: () => { try { abortKeys.abort(); } catch (e) {} },
   };
-  node.addCustomWidget(widget);
+  /* ═══ 原生控件 widget（用户 2026-10-14 架构）═══
+   * 全部 `serialize:false` —— 它们**绝不能**进 widgets_values（唯一真源仍是
+   * width/height/cell/regions/show_grid/background_file），否则又会造出"按位置错位 ⇒ NaN"。
+   * 顺序：原生 widget 先加、画布 widget 最后加 ⇒ 画布那一行天然在所有输入行下面。 */
+
+  //: ① 画笔颜色（combo，值域就是固定顺序）
+  node.addWidget("combo", "paint_color", state.active, (v) => {
+    state.active = COLORS.includes(v) ? v : "red";
+    repaint();
+  }, { values: COLORS.slice(), serialize: false });
+
+  //: ② 宽高预设（combo）—— 选它只**写现有的 width/height**，不新增尺寸 widget
+  const refreshAspect = () => {
+    const w = Math.round(W("width", DEFAULT_W)), h = Math.round(W("height", DEFAULT_H));
+    const hitA = ASPECTS.find(([, a, b]) => a === w && b === h);
+    const aw = find("aspect");
+    if (aw) aw.value = hitA ? hitA[0] : "自定义";
+  };
+  node.addWidget("combo", "aspect", "16:9", (v) => {
+    const a = ASPECTS.find(([l]) => l === v);
+    if (a) applySize(a[1], a[2]);      //: 只改 width/height 两个现有 widget
+    refreshAspect();
+  }, { values: ASPECTS.map(([l]) => l).concat(["自定义"]), serialize: false });
+
+  //: ③ 上传底图（button + 隐藏 input）
+  node.addWidget("button", "上传底图", "upload", () => { pickAndUpload(); }, { serialize: false });
+  //: ④ 撤销 / 清空 / regions 文本
+  node.addWidget("button", "撤销", "undo", () => { undo(); }, { serialize: false });
+  node.addWidget("button", "清空", "clear", () => { pushUndo(); state.cells = {}; push(); }, { serialize: false });
+  node.addWidget("button", "regions文本", "edit_regions", () => { editRegions(); }, { serialize: false });
+
+  //: ⚠️ 保险：无论 store 怎么写，这些控件**一律不进 widgets_values**
+  for (const nm of ["paint_color", "aspect", "上传底图", "撤销", "清空", "regions文本"]) {
+    const cw2 = find(nm);
+    if (cw2) { try { cw2.serialize = false; } catch (e) {} try { if (cw2.options) cw2.options.serialize = false; } catch (e) {} }
+  }
+
+  node.addCustomWidget(widget);   //: ⭐ 画布**最后**加 ⇒ 排在所有输入行下面
 
   /* ── 节点级鼠标入口（本轮唯一的改动点） ──
    * 用节点级而不是 widget.mouse：命中判断完全吃我们自己的 state.layout 矩形，
@@ -915,11 +842,15 @@ function buildGridCanvasWidget(node) {
     //: ⭐ 诊断打印（本轮要求）：区分"事件没派发" vs "派发了但我们没命中"
     try {
       const L = state.layout;
-      console.log("[grid_node_widget] onMouseDown", {
+      const _w = find("grid_canvas");
+      console.log("[grid_node_widget] onMouseDown " + JSON.stringify({
         pos: pos ? [Math.round(pos[0]), Math.round(pos[1])] : null,
+        rowTop: rowTop(), rowH: rowH(),
+        hit: hitCanvas(pos ? pos[0] : 0, pos ? pos[1] : 0),
         claimed: !!r,
-        layout: L ? { yCv: L.yCv, ch: L.ch, canvasW: L.canvasW, y0: L.y0, total: L.total } : null,
-      });
+        layout: L ? { yCv: L.yCv, ch: L.ch, canvasW: L.canvasW, total: L.total } : null,
+        widget: _w ? { y: _w.y, last_y: _w.last_y, computedHeight: _w.computedHeight } : null,
+      }));
     } catch (er) {}
     if (r) { if (e && e.stopPropagation) { try { e.stopPropagation(); } catch (er) {} } return true; }
     return chainDown ? chainDown.call(this, e, pos, canvas) : false;
@@ -1018,15 +949,22 @@ function buildGridCanvasWidget(node) {
   };
 
   /* ── 高度兜底：节点体高不够就**一次性**调够（⚠️ 绝不在 onResize 里 setSize） ── */
+  /* ⭐ 用户要求：节点在屏幕上的像素尺寸**精确 2048×2048**（创建时一次设定）。
+   * ⚠️ 仍然**禁止在 onResize 里 setSize**（会 onResize→setSize→onResize 无限递归）。 */
+  const NODE_W_FIXED = 2048, NODE_H_FIXED = 2048;
   function ensureNodeTallEnough() {
+    try { node.size = [NODE_W_FIXED, NODE_H_FIXED]; } catch (e) {}
+  }
+
+  /* 画布高度取"节点高 − 前面那些原生行占的高"的剩余值（宁可略小，**不把节点撑大**） */
+  function canvasRoomH() {
     try {
-      const need = contentH() + (Number.isFinite(Number(node.size && node.size[0])) ? 0 : 0);
-      const cur = Number(node.size && node.size[1]);
-      //: 节点体高 = size[1]；widget 从 node.size[1] 之前的行开始，所以留一点余量
-      if (!Number.isFinite(cur) || cur < need + 40) {
-        node.size = [node.size && node.size[0] || BASE_W, Math.max(320, need + 60)];
-      }
+      const bh = Number(node.size && node.size[1]);
+      const w = find("grid_canvas");
+      const wy = Number.isFinite(w && w.y) ? Math.round(w.y) : 0;
+      if (Number.isFinite(bh) && bh > 0) return Math.max(48, Math.round(bh) - wy - 4);
     } catch (e) {}
+    return MAX_CANVAS_H;
   }
 
   //: 只读调试出口：给自动化验收核对"声明的行高 == 实际绘制总高"
@@ -1050,7 +988,7 @@ function buildGridCanvasWidget(node) {
   //: null 尺寸会让 litegraph 的布局出 NaN。只在明显不合法时才动。
   if (!Array.isArray(node.size) || !Number.isFinite(node.size[0]) || !Number.isFinite(node.size[1])
       || node.size[0] < 200 || node.size[1] < 200) {
-    node.size = [BASE_W, Math.max(320, contentH() + 120)];
+    node.size = [NODE_W_FIXED, NODE_H_FIXED];
   }
   const nm0 = String(W("background_file", "") || "");
   if (nm0) loadBg(nm0);
@@ -1074,7 +1012,22 @@ app.registerExtension({
       const orig = nodeType.prototype.onConfigure;
       nodeType.prototype.onConfigure = function (info) {
         try { repairLegacyWidgets(nodeData, info, this); } catch (e) {}
-        return orig ? orig.apply(this, arguments) : undefined;
+        const r = orig ? orig.apply(this, arguments) : undefined;
+        //: ⭐ 用户要求节点**精确 2048×2048**：老工作流里存的 size 会在 onConfigure 里覆盖掉
+        //:    创建时设的值，所以配置完成后**再钉一次**（用 setTimeout 避开本次配置流程，
+        //:    且**不是**在 onResize 里 setSize，不会递归）。
+        try {
+          const self = this;
+          setTimeout(() => {
+            try {
+              if (self && self.size && (self.size[0] !== 2048 || self.size[1] !== 2048)) {
+                self.setSize([2048, 2048]);
+                self.graph && self.graph.setDirtyCanvas(true, true);
+              }
+            } catch (e) {}
+          }, 0);
+        } catch (e) {}
+        return r;
       };
     } catch (e) {
       console.warn("[grid_node_widget] onConfigure 钩子挂载失败（不影响加载）:", e && e.message);
