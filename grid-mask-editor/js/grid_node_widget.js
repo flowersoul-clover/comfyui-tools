@@ -52,8 +52,11 @@ const ASPECTS = [["16:9", 1344, 768], ["3:2", 1216, 832], ["4:3", 1152, 896],
                  ["1:1", 1024, 1024], ["3:4", 896, 1152], ["2:3", 832, 1216],
                  ["9:16", 768, 1344]];
 
-//: 画布逻辑宽度（不随节点宽度变 ⇒ 不抖）；高度按内容比例算
+//: 画布**兜底宽度**（只在还没画过 / 传入宽度非法时用）；真实宽度一律取 litegraph 传进来的 width
 const BASE_W = 560;
+//: 最小宽度：三行控件（色板 8×49=389 + 档位 6×39=231 + 预设 7×37=256 ≈ 599，减掉右端尺寸字）
+//: 需要的下限。比这个更窄时把节点撑住，否则控件会互相挤。
+const MIN_W = 640;
 const SWATCH_H = 18;      //: 色板行
 const RES_H = 18;         //: 分辨率 + 宽高预设行
 const BTN_H = 18;         //: 功能按钮行
@@ -238,6 +241,15 @@ function buildGridCanvasWidget(node) {
     hits: { swatch: {}, res: [], aspect: [], actions: {} },
     ctx: null,
   };
+  //: 最近一次真实绘制用的宽度（0 = 还没画过）。computeSize 与它共用 ⇒ 声明宽度==绘制宽度
+  let lastDrawnW = 0;
+  /* ── 垂直原点对齐（实测踩到的大坑） ──
+   * graph-canvas 那条渲染路径里，litegraph 会把 widget 的绘制上下文**再整体上移一个
+   * `widget.y`**，但命中测试 `getWidgetOnPos()` 用的是 `last_y`（= widget.y）所在的
+   * 节点内坐标系。两者差了一个 widget.y ⇒ 实测：画出来的内容在节点内 y≈14，
+   * 而点击要到 y≥146 才算命中；结果是"看得见、点不着"，且画面压在标题栏上。
+   * 这里让**绘制与命中共用同一个原点**：从"命中坐标系"的 widget.y 开始画。
+   * 这样：① 点击落点与视觉一致；② 画面也不再压标题栏（正好在第一行 widget 下面）。 */
 
   /* ── 网格几何：cols/rows 由 width/height/cell 决定（下面多处要用，先定义） ── */
   function grid() {
@@ -255,9 +267,13 @@ function buildGridCanvasWidget(node) {
     const c = grid();
     return finiteInt(BASE_W * c.rows / c.cols, BASE_W * DEFAULT_H / DEFAULT_W, 48, MAX_CANVAS_H);
   };
-  //: ⚠️ computeSize() 直接吃这个 ⇒ 必须保证是有限正整数
-  const contentH = () => finiteInt(
-    SWATCH_H + RES_H + BTN_H + canvasH() + INFO_H + ROW_GAP * 4 + 6, 430, 64, 4096);
+  //: ⚠️ computeSize() 直接吃这个 ⇒ 必须保证是有限正整数。
+  //:    高度取决于**实际渲染了几行**（窄节点会多一行操作区），所以按 layout() 的结果累计，
+  //:    不能写死 5 行的常量 —— 否则窄节点会溢出/叠行。
+  const contentH = () => {
+    try { return finiteInt(layout(lastDrawnW || BASE_W).total, 430, 64, 4096); }
+    catch (e) { return finiteInt(SWATCH_H + RES_H + BTN_H + canvasH() + INFO_H + ROW_GAP * 4 + 6, 430, 64, 4096); }
+  };
 
   /* ── 自愈：老工作流按位置灌错值 ⇒ 把坏掉的数值 widget 归位 ──
    * 只在"确实不是有限数"时才写，绝不覆盖合法值。不这么做的话画布虽然能画了，
@@ -308,6 +324,7 @@ function buildGridCanvasWidget(node) {
     setRegionsTextQuiet(toRegions(state.cells, grid().cols, grid().rows));
     repaint();
   }
+
   function pull() {   //: 手改 regions 文本 → 画布重画回来
     const g = grid();
     const t = getRegionsText();
@@ -420,27 +437,94 @@ function buildGridCanvasWidget(node) {
 
   /* ─────────────────────────── 绘制 ─────────────────────────── */
 
+  /* ── 布局（宽度自适应版） ──
+   * ⚠️ 实测踩到：早期版本三行控件**写死 599px 宽**，与节点实际宽度无关 ⇒
+   *    - 节点比 599 窄时，色板/档位/预设会**画到节点外面**（用户看到的"挤在右侧、和画布并排/重叠"）；
+   *    - 节点比 599 宽时，`1216×704` 这类靠右对齐的字跑到画布外。
+   * 修法：**一切从实际可用宽度 `w` 出发**，按"整块（块1 色板 / 块2 档位+预设 / 块3 操作）依次排"，
+   * 放不下就换行；块1 放不下才退化到"单色板 + 省掉块5"。
+   * 同时用同一个 `w` 去算 `computeSize`，保证"声明宽度 == 绘制宽度"。 */
   function layout(width) {
-    //: ⚠️ width 也可能是 NaN（litegraph 在渲染尺寸没算好时会传进来），
+    //: ⚠️ width 也可能是 NaN（litegraph 渲染尺寸没算好时会传进来），
     //:    而 NaN||BASE_W 仍然是 NaN ⇒ 必须走 asFinite
-    const w = finiteInt(width, BASE_W, 160, 4096);
+    const avail = finiteInt(width, BASE_W, MIN_W, 4096);
     const ch = canvasH();
-    const top = 2;
-    const ySwatch = top;
-    const yRes = ySwatch + SWATCH_H + ROW_GAP;
-    const yBtn = yRes + RES_H + ROW_GAP;
-    const yCv = yBtn + BTN_H + ROW_GAP;
+    const pad = 2;
+    const gap = 3;
+    const wCv = Math.max(80, avail - 4);
+
+    //: 块尺寸（与真实按钮宽度逐字一致）
+    const BW = { sw: 46, res: 36, asp: 34, upload: 58, undo: 40, clear: 40, reg: 66 };
+    const blockSw = COLORS.length * (BW.sw + gap) - gap;                        //: 色板
+    const blockRes = STEPS.length * (BW.res + gap) - gap;                       //: 档位
+    const blockAsp = ASPECTS.length * (BW.asp + gap) - gap;                     //: 预设
+    const blockAct = BW.upload + gap + BW.undo + gap + BW.clear + gap + BW.reg; //: 操作
+
+    //: 从可用宽度里扣掉"块5（右端尺寸字 + 状态行第二段）"需要的固定位置
+    const dimText = `${finiteInt(W("width", DEFAULT_W), DEFAULT_W, 1, 100000)}×` +
+                    `${finiteInt(W("height", DEFAULT_H), DEFAULT_H, 1, 100000)}`;
+    const right0 = 54;
+    let x = pad;
+    const rows = [];
+
+    //: 第1行：色板（永远在最左，不参与换行顺序）
+    //: ⚠️ 这里**必须给 x0**：上一版漏了 ⇒ 画色板时 x 从 undefined 起算，
+    //:    第一个色块就落到 NaN 上，整行色板全画不出来（浏览器实测整行消失）。
+    rows.push({ items: COLORS.map((c) => ({ label: c, c })), key: "swatch", h: SWATCH_H, x0: pad });
+    x = pad + blockSw + gap;
+    //: 第2行：档位 + 预设（整块搬，"9:16" 不会被拆散）
+    let row2 = [];
+    if (x + blockRes <= avail - 4) {
+      row2 = STEPS.map((px) => ({ label: px + "px", px }));
+      x += blockRes + gap;
+      if (x + blockAsp <= avail - 4) { row2 = row2.concat(ASPECTS.map(([l]) => ({ label: l, aspect: l }))); x += blockAsp + gap; }
+    }
+    rows.push({ items: row2, key: "res", h: RES_H, x0: pad + blockSw + gap });
+    //: 第3行：操作（整块）＋ 右端尺寸字
+    const actRow = [];
+    if (x + blockAct <= avail - 4 - right0) {
+      actRow.push({ label: "上传底图", act: "upload", w: BW.upload });
+      actRow.push({ label: "撤销", act: "undo", w: BW.undo });
+      actRow.push({ label: "清空", act: "clear", w: BW.clear });
+      actRow.push({ label: "regions文本", act: "regions", w: BW.reg });
+    } else {
+      //: 太窄：换到第4行（整行给操作），还放不下就只留最关键的两个
+      if (blockAct + right0 <= avail - pad * 2) {
+        actRow.push({ label: "上传底图", act: "upload", w: BW.upload });
+        actRow.push({ label: "撤销", act: "undo", w: BW.undo });
+        actRow.push({ label: "清空", act: "clear", w: BW.clear });
+        actRow.push({ label: "regions", act: "regions", w: 50 });
+      } else {
+        actRow.push({ label: "上传", act: "upload", w: 36 });
+        actRow.push({ label: "撤销", act: "undo", w: 36 });
+        actRow.push({ label: "清空", act: "clear", w: 36 });
+      }
+    }
+    rows.push({ items: actRow, key: "actions", h: BTN_H, x0: pad, rightText: dimText });
+
+    //: ⚠️ 只用**一套** y 坐标（节点内坐标）：litegraph 的鼠标事件、`getWidgetOnPos()`
+    //:    和这里画出来的东西全部共用它 ⇒ 视觉与点击天然一致，不会出现"看得见点不着"。
+    let cy = 2;
+    const yOf = {};
+    for (const r of rows) { r.y = cy; yOf[r.key] = cy; cy += r.h + ROW_GAP; }
+    const yCv = cy;
     const yInfo = yCv + ch + ROW_GAP;
-    return { w, ch, ySwatch, yRes, yBtn, yCv, yInfo,
-             canvasW: w - 4, total: yInfo + INFO_H + 4 };
+    return {
+      w: avail, ch, canvasW: wCv, x0: pad,
+      ySwatch: yOf.swatch, yRes: yOf.res, yBtn: yOf.actions, yCv, yInfo,
+      rows, blockGap: gap, BW,
+      total: yInfo + INFO_H + 4,
+    };
   }
 
+  /* ── 三行控件按 L.rows 的排布来画（宽度自适应，且**命中矩形与画出来的一定一致**） ── */
   function drawPalette(ctx, L) {
-    const pad = 2, sw = 46, gap = 3, h = SWATCH_H - 4;
+    const h = SWATCH_H - 4, gap = L.blockGap, sw = L.BW.sw;
     state.hits.swatch = {};
-    let x = pad;
+    const row = L.rows.find((r) => r.key === "swatch");
+    let x = row ? row.x0 : 2;
     for (const c of COLORS) {
-      const r = button(ctx, x, L.ySwatch + 2, sw, h, c, {
+      const r = button(ctx, x, row.y + 2, sw, h, c, {
         active: c === state.active, bg: RGB[c],
         fg: (c === "black" || c === "blue" || c === "magenta") ? "#fff" : "#000",
         font: "9px system-ui",
@@ -451,31 +535,37 @@ function buildGridCanvasWidget(node) {
   }
 
   function drawResAndAspect(ctx, L) {
-    const pad = 2, h = RES_H - 4;
-    let x = pad;
-    state.hits.res = [];
-    for (const px of STEPS) {   //: 网格分辨率档位
-      const r = button(ctx, x, L.yRes + 2, 36, h, px + "px", { active: px === cellPx() });
-      state.hits.res.push({ px, rect: r });
-      x += 36 + 3;
-    }
-    state.hits.aspect = [];
-    for (const [lab, w, hh] of ASPECTS) {   //: 宽高预设（只改 width/height）
-      const active = Math.round(W("width", DEFAULT_W)) === w && Math.round(W("height", DEFAULT_H)) === hh;
-      const r = button(ctx, x, L.yRes + 2, 34, h, lab, { active });
-      state.hits.aspect.push({ w, h: hh, rect: r });
-      x += 34 + 3;
-    }
+    const h = RES_H - 4, gap = L.blockGap;
+    state.hits.res = []; state.hits.aspect = [];
+    const row = L.rows.find((r) => r.key === "res");
+    if (!row) return;
+    let x = row.x0 || 2;
+    const put = (item) => {
+      let w = 0, active = false;
+      if (item.px !== undefined) { w = L.BW.res; active = item.px === cellPx(); }
+      else {
+        const a = ASPECTS.find(([l]) => l === item.aspect);
+        w = L.BW.asp;
+        active = a ? (Math.round(W("width", DEFAULT_W)) === a[1] && Math.round(W("height", DEFAULT_H)) === a[2]) : false;
+      }
+      const r = button(ctx, x, row.y + 2, w, h, item.label, { active });
+      if (item.px !== undefined) state.hits.res.push({ px: item.px, rect: r });
+      else { const a = ASPECTS.find(([l]) => l === item.aspect); if (a) state.hits.aspect.push({ w: a[1], h: a[2], rect: r }); }
+      x += w + gap;
+    };
+    row.items.forEach(put);
   }
 
   function drawActions(ctx, L) {
-    const pad = 2, h = BTN_H - 4, y = L.yBtn + 2;
+    const h = BTN_H - 4, gap = L.blockGap, y = L.yBtn + 2;
     state.hits.actions = {};
-    let x = pad;
-    state.hits.actions.upload = button(ctx, x, y, 58, h, "上传底图"); x += 58 + 3;
-    state.hits.actions.undo = button(ctx, x, y, 40, h, "撤销", { active: undoStack.length > 0 }); x += 40 + 3;
-    state.hits.actions.clear = button(ctx, x, y, 40, h, "清空"); x += 40 + 3;
-    state.hits.actions.regions = button(ctx, x, y, 66, h, "regions文本");
+    const row = L.rows.find((r) => r.key === "actions");
+    let x = row ? (row.x0 || 2) : 2;
+    for (const it of (row ? row.items : [])) {
+      const r = button(ctx, x, y, it.w, h, it.label, { active: it.act === "undo" && undoStack.length > 0 });
+      state.hits.actions[it.act] = r;
+      x += it.w + gap;
+    }
     const dim = `${finiteInt(W("width", DEFAULT_W), DEFAULT_W, 1, 100000)}×${finiteInt(W("height", DEFAULT_H), DEFAULT_H, 1, 100000)}`;
     ctx.save();
     ctx.font = "10px system-ui"; ctx.textAlign = "right"; ctx.textBaseline = "middle";
@@ -540,7 +630,8 @@ function buildGridCanvasWidget(node) {
     ctx.font = "10px system-ui"; ctx.textAlign = "left"; ctx.textBaseline = "top";
     ctx.fillStyle = "#9a9aa5";
     ctx.fillText(`${state.cols}×${state.rows} 格（${cellPx()}px/格）`, 4, L.yInfo + 1);
-    const line = parts || "还没涂（左键涂 / 右键或 Shift 擦 / 上面按钮可把网格调细）";
+    //: 提示文案跟着交互改：**点击切换**（右键被 ComfyUI 上下文菜单占了，不再提"右键擦"）
+    const line = parts || "还没涂（单击涂 / 再点一下取消，可拖动连涂或连擦，Shift=擦）";
     ctx.fillStyle = parts ? "#cfc" : "#777";
     ctx.fillText(line.length > 88 ? line.slice(0, 87) + "…" : line, 4, L.yInfo + 13);
     if (status2) {   //: 上传等操作的临时状态（只在右侧补一句，不覆盖格数统计）
@@ -555,12 +646,20 @@ function buildGridCanvasWidget(node) {
   function draw(ctx, n, width) {
     if (!ctx) return 0;
     const L = layout(width);
-    L.canvasW = L.w - 4;
-    state.layout = L;
-    state.ctx = ctx;
+    //: ⚠️ 记下"真实可用宽度"，computeSize 要用**同一个值**（同一值 ⇒ 不会溢出/叠行）
+    lastDrawnW = L.w;
+    //: ⚠️ 只有**主画布**的 ctx 才更新"交互用的 layout/ctx"。
+    //:    小地图(minimap)之类会拿同一个 widget 在别的 canvas 上再画一遍，若用它的 ctx
+    //:    覆盖 state.ctx，重绘就会画错地方/命中框跟着错位（实测点击时灵时不灵的真凶之一）。
+    let isMain = true;
+    try { isMain = !!(app.canvas && ctx === app.canvas.ctx); } catch (e) { isMain = true; }
+    if (isMain) { state.layout = L; state.ctx = ctx; }
     ctx.save();
+    //: 兜底裁剪：即使某行算错，也绝不画到节点外面去（用户看到的就是"不重叠"）
+    ctx.beginPath(); ctx.rect(0, 0, L.w, L.total); ctx.clip();
     ctx.fillStyle = "#1e1e22";
     ctx.fillRect(0, 0, L.w, L.total);
+
     drawPalette(ctx, L);
     drawResAndAspect(ctx, L);
     drawActions(ctx, L);
@@ -581,9 +680,11 @@ function buildGridCanvasWidget(node) {
   }
 
   /* ── 画布坐标 → 格 ── */
-  function cellAt(x, y) {
+  function cellAt(x, yNodeLocal) {
     ensureLayout();
     const L = state.layout; if (!L) return null;
+    //: 事件与 hits 矩形都在**节点内**坐标（frame）空间 ⇒ 这里不做任何换算
+    const y = yNodeLocal;
     if (y < L.yCv || y > L.yCv + L.ch || x < 2 || x > L.canvasW + 2) return null;
     const c = Math.floor((x - 2) / (L.canvasW / state.cols));
     const r = Math.floor((y - L.yCv) / (L.ch / state.rows));
@@ -600,44 +701,65 @@ function buildGridCanvasWidget(node) {
     return L;
   }
 
-  /* ─────────────────── 鼠标事件（litegraph 直接派发给 widget） ─────────────────── */
-  /* PainterNode 的机制：widget.mouse(event, pos, node)；
-   * down 时 `pos` 是节点内相对坐标，拖拽时是 `[e.offsetX, e.offsetY]`。 */
-  function mouse(e, pos, n) {
-    const x = pos ? pos[0] : (e.offsetX || 0);
-    const y = pos ? pos[1] : (e.offsetY || 0);
+  /* ── 画布矩形命中：只用**我们自己的** layout（不碰 litegraph 的 getWidgetOnPos/last_y） ──
+   * litegraph 的 widget 命中测试与我们的绘制位置实测差 84~146px（且 widget.y 会瞬变 0），
+   * 所以改用**节点级鼠标事件**（node.onMouseDown/Move/Up，pos 就是节点内坐标），
+   * 命中判断完全由下面的矩形决定。 */
+  function hitCanvas(x, yNodeLocal) {
     ensureLayout();
     const L = state.layout;
-    if (!L) return;
-    const type = e.type;
+    if (!L) return null;
+    //: 命中矩形 = state.layout 里的画布区（与 draw 的坐标同一套）
+    if (yNodeLocal < L.yCv || yNodeLocal > L.yCv + L.ch) return null;
+    if (x < 2 || x > L.canvasW + 2) return null;
+    const c = Math.floor((x - 2) / (L.canvasW / state.cols));
+    const r = Math.floor((yNodeLocal - L.yCv) / (L.ch / state.rows));
+    if (c < 0 || c >= state.cols || r < 0 || r >= state.rows) return null;
+    return { c, r };
+  }
+
+  /* ─────────────────── 鼠标处理（**节点级**，不再用 widget.mouse） ─────────────────── */
+  /* litegraph 会把节点内坐标的鼠标事件交给 node.onMouseDown/Move/Up；
+   * 返回 true ⇒ 吃掉事件（不会被当成"拖节点"）；返回 false ⇒ 放行给节点拖动/其它 widget。 */
+  function handleMouse(type, x, y, e) {
+    ensureLayout();
+    const L = state.layout;
+    if (!L) return false;
 
     if (type === "pointerdown" || type === "mousedown") {
       //: 顶部按钮区
       for (const c in state.hits.swatch)
-        if (hit(state.hits.swatch[c], x, y)) { state.active = c; repaint(); return; }
+        if (hit(state.hits.swatch[c], x, y)) { state.active = c; repaint(); return true; }
       for (const it of state.hits.res)
-        if (hit(it.rect, x, y)) { refineTo(it.px); return; }
+        if (hit(it.rect, x, y)) { refineTo(it.px); return true; }
       for (const it of state.hits.aspect)
-        if (hit(it.rect, x, y)) { applySize(it.w, it.h); return; }
+        if (hit(it.rect, x, y)) { applySize(it.w, it.h); return true; }
       const A = state.hits.actions;
-      if (hit(A.upload, x, y)) { pickAndUpload(); return; }
-      if (hit(A.undo, x, y)) { undo(); return; }
-      if (hit(A.clear, x, y)) { pushUndo(); state.cells = {}; push(); return; }
-      if (hit(A.regions, x, y)) { editRegions(); return; }
+      if (hit(A.upload, x, y)) { pickAndUpload(); return true; }
+      if (hit(A.undo, x, y)) { undo(); return true; }
+      if (hit(A.clear, x, y)) { pushUndo(); state.cells = {}; push(); return true; }
+      if (hit(A.regions, x, y)) { editRegions(); return true; }
       //: 画布区：开始一笔（**此时入栈**，拖动过程中不再入 ⇒ 一次连续拖动 = 一步）
       const p = cellAt(x, y);
       if (p) {
         state.painting = true;
         pushUndo();
-        state.erase = (e.button === 2) || !!e.shiftKey || (e.buttons & 2) === 2;
         const k = p.c + "," + p.r;
+        /* ⭐ 交互（用户 2026-10-13 要求）：**点击切换**，右键在 ComfyUI 里被上下文菜单占了。
+         *   - Shift 按住 ⇒ 强制擦除（保留的快捷方式）
+         *   - 起始格**已经是当前颜色** ⇒ 整笔擦除；否则整笔涂色
+         *   ⇒ 这样既能拖着一片涂，也能从已涂的格开始拖着一片擦，且拖动中模式**不变**（不闪）。 */
+        const forceErase = !!e.shiftKey || e.button === 2 || e.which === 3;
+        state.erase = forceErase || state.cells[k] === state.active;
         if (state.erase) delete state.cells[k]; else state.cells[k] = state.active;
         repaint();   //: 拖动中**只重绘**，松手才写 regions（细格时字符串几千段）
+        return true;
       }
-      return;
+      return false;               //: 点在节点上但不是画布/按钮 ⇒ 放行（可拖节点）
     }
 
     if (type === "pointermove" || type === "mousemove") {
+      if (!state.painting && !hitCanvas(x, y)) return false;   //: 没在画、也不在画布上 ⇒ 放行
       if (state.painting) {
         const p = cellAt(x, y);
         if (p) {
@@ -652,18 +774,19 @@ function buildGridCanvasWidget(node) {
         state.hover = p;
         if (!same) repaint();
       }
-      return;
+      return true;
     }
 
     if (type === "pointerup" || type === "mouseup" || type === "pointercancel") {
       if (state.painting) {
         state.painting = false;
         push();      //: 松手才写 regions
+        return true;
       }
       return;
     }
 
-    if (type === "dblclick") { return; }
+    return false;
   }
 
   /* ── Ctrl+Z 的监听句柄（提前建，下面 widget.onRemove 要用） ── */
@@ -679,12 +802,43 @@ function buildGridCanvasWidget(node) {
     serialize: false,
     serializeValue: () => undefined,
     draw,
-    mouse,
-    //: ⚠️ 固定值、**不依赖传入的 width**（依赖 width ⇒ 节点一变宽就重算高度 ⇒ 抖动/大小不定）
-    computeSize: () => [BASE_W, contentH()],
+    //: ⚠️ 宽度必须与**实际绘制宽度**一致（`lastDrawnW` 就是 draw 收到的那个 width），
+    //:    否则"声明 560、实画 599" ⇒ 溢出/与别的 widget 行叠在一起（用户实测踩到）。
+    //:    高度只取决于**格子数**（与宽度无关）⇒ 不存在"变宽就重算高度"的抖动。
+    //:    `MIN_W` 是保守下限：比它还窄时把节点撑到这个宽度，保证三行控件放得下。
+    computeSize: () => [Math.max(MIN_W, lastDrawnW || MIN_W), contentH()],
     onRemove: () => { try { abortKeys.abort(); } catch (e) {} },
   };
   node.addCustomWidget(widget);
+
+  /* ── 节点级鼠标入口（本轮唯一的改动点） ──
+   * 用节点级而不是 widget.mouse：命中判断完全吃我们自己的 state.layout 矩形，
+   * 不再依赖 litegraph 的 getWidgetOnPos / last_y / computedHeight。
+   * 返回 true 吃掉事件（避免被当成拖节点），false 放行。 */
+  /* ⚠️ 顺序：**先跑我们的判断**，命中就 return true 吃掉（不再调原 handler）；
+   *    没命中才把事件交给原来的 handler。反过来的话，原 handler 可能先消费事件，
+   *    于是出现"点击时灵时不灵 / N 次只进 M 次"（实测踩到）。 */
+  const chainDown = node.onMouseDown;
+  node.onMouseDown = function (e, pos, canvas) {
+    let r = false;
+    try { r = handleMouse("pointerdown", pos ? pos[0] : 0, pos ? pos[1] : 0, e || {}); } catch (er) { r = false; }
+    if (r) { if (e && e.stopPropagation) { try { e.stopPropagation(); } catch (er) {} } return true; }
+    return chainDown ? chainDown.call(this, e, pos, canvas) : false;
+  };
+  const chainMove = node.onMouseMove;
+  node.onMouseMove = function (e, pos, canvas) {
+    let r = false;
+    try { r = handleMouse("pointermove", pos ? pos[0] : 0, pos ? pos[1] : 0, e || {}); } catch (er) { r = false; }
+    if (r) return true;
+    return chainMove ? chainMove.call(this, e, pos, canvas) : false;
+  };
+  const chainUp = node.onMouseUp;
+  node.onMouseUp = function (e, pos, canvas) {
+    let r = false;
+    try { r = handleMouse("pointerup", pos ? pos[0] : 0, pos ? pos[1] : 0, e || {}); } catch (er) { r = false; }
+    if (r) return true;
+    return chainUp ? chainUp.call(this, e, pos, canvas) : false;
+  };
   //: litegraph 的 `_arrangeWidgets` 正是用 `computeSize()[1]` 写 computedHeight，
   //: 命中测试 `getWidgetOnPos` 用的也是 computedHeight ⇒ 先给一个初始值。
   widget.computedHeight = contentH();
