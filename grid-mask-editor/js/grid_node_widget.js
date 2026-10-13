@@ -243,6 +243,7 @@ function buildGridCanvasWidget(node) {
   };
   //: 最近一次真实绘制用的宽度（0 = 还没画过）。computeSize 与它共用 ⇒ 声明宽度==绘制宽度
   let lastDrawnW = 0;
+  let lastDrawArgs = null;      //: 最近一次 draw 收到的 (width, y, height) 与我们的总高
   /* ── 垂直原点对齐（实测踩到的大坑） ──
    * graph-canvas 那条渲染路径里，litegraph 会把 widget 的绘制上下文**再整体上移一个
    * `widget.y`**，但命中测试 `getWidgetOnPos()` 用的是 `last_y`（= widget.y）所在的
@@ -270,9 +271,23 @@ function buildGridCanvasWidget(node) {
   //: ⚠️ computeSize() 直接吃这个 ⇒ 必须保证是有限正整数。
   //:    高度取决于**实际渲染了几行**（窄节点会多一行操作区），所以按 layout() 的结果累计，
   //:    不能写死 5 行的常量 —— 否则窄节点会溢出/叠行。
+  const contentNaturalH = () => {
+    try { return layout(lastDrawnW || BASE_W, 0, Infinity, Infinity).total; }
+    catch (e) { return 600; }
+  };
+  /* ⭐ 报给 litegraph 的高度 = **从节点顶算起的绝对总高**
+   * = 我们这一行的起点 y（= 前面那些内置 widget 占到的高度，交给 litegraph 的 widget.y）
+   *   + 这一行画出来的总高。
+   * ⚠️ 这正是用户找到的根因：之前只报"自身高"(428)，而 draw 是从 y=146 开始画的(画到 720)，
+   *    声明少了 146 ⇒ 行分得太小 ⇒ 画布下半部分落在行外 ⇒ 点击被判给下面那些 widget
+   *    （width/height/cell/show_grid/background_file），点不到我们。
+   *    同一份 layout() 既用于绘制也用于报高度 ⇒ 两者天然一致。 */
   const contentH = () => {
-    try { return finiteInt(layout(lastDrawnW || BASE_W).total, 430, 64, 4096); }
-    catch (e) { return finiteInt(SWATCH_H + RES_H + BTN_H + canvasH() + INFO_H + ROW_GAP * 4 + 6, 430, 64, 4096); }
+    try {
+      const w = find("grid_canvas");
+      const wy = Number.isFinite(w && w.y) && w.y > 0 ? Math.round(w.y) : 0;
+      return finiteInt(wy + layout(lastDrawnW || BASE_W, wy, Infinity, Infinity).total, 64, 64, 16384);
+    } catch (e) { return finiteInt(64 + contentNaturalH(), 64, 64, 16384); }
   };
 
   /* ── 自愈：老工作流按位置灌错值 ⇒ 把坏掉的数值 widget 归位 ──
@@ -444,11 +459,21 @@ function buildGridCanvasWidget(node) {
    * 修法：**一切从实际可用宽度 `w` 出发**，按"整块（块1 色板 / 块2 档位+预设 / 块3 操作）依次排"，
    * 放不下就换行；块1 放不下才退化到"单色板 + 省掉块5"。
    * 同时用同一个 `w` 去算 `computeSize`，保证"声明宽度 == 绘制宽度"。 */
-  function layout(width) {
+  function layout(width, y0, availH, drawH) {
     //: ⚠️ width 也可能是 NaN（litegraph 渲染尺寸没算好时会传进来），
     //:    而 NaN||BASE_W 仍然是 NaN ⇒ 必须走 asFinite
     const avail = finiteInt(width, BASE_W, MIN_W, 4096);
-    const ch = canvasH();
+    //: ⭐ 画布顶部锚定：**从 litegraph 给的 y 开始**排（控件在上、画布紧跟、状态行最后）。
+    //:    （用户 2026-10-13 找到的根因：之前用自己假设的原点，声明高度又比实际画的小。）
+    const top = finiteInt(y0, 0, 0, 8192);
+    //: 这一行能用的高度：litegraph 分配的 drawH，以及节点体剩下多少（两者取小，再留一点）
+    const budget = (Number.isFinite(availH) && availH > 0)
+      ? Math.max(24, Math.floor(availH) - top - 2)
+      : Infinity;
+    //: 状态行放不下就**宁可裁掉它**，绝不让画布溢出行外（用户明确要求）
+    const needInfo = INFO_H + ROW_GAP;
+    const ch = Math.max(24, Math.min(canvasH(), budget - (SWATCH_H + RES_H + BTN_H + ROW_GAP * 3 + needInfo)));
+    const showInfo = budget === Infinity || (SWATCH_H + RES_H + BTN_H + ROW_GAP * 3 + ch + needInfo) <= budget;
     const pad = 2;
     const gap = 3;
     const wCv = Math.max(80, avail - 4);
@@ -502,18 +527,19 @@ function buildGridCanvasWidget(node) {
     }
     rows.push({ items: actRow, key: "actions", h: BTN_H, x0: pad, rightText: dimText });
 
-    //: ⚠️ 只用**一套** y 坐标（节点内坐标）：litegraph 的鼠标事件、`getWidgetOnPos()`
-    //:    和这里画出来的东西全部共用它 ⇒ 视觉与点击天然一致，不会出现"看得见点不着"。
-    let cy = 2;
+    //: ⚠️ 只用**一套** y 坐标（= 绘制坐标，节点内）：鼠标事件、命中矩形、画出来的东西共用它
+    let cy = top + 2;
     const yOf = {};
     for (const r of rows) { r.y = cy; yOf[r.key] = cy; cy += r.h + ROW_GAP; }
     const yCv = cy;
     const yInfo = yCv + ch + ROW_GAP;
+    //: ⭐ 总高**精确等于实际绘制的高度**（用户要求：一像素都不许少），
+    //:    `computeSize()` 直接回这个数 ⇒ 声明高度 == 绘制高度。
+    const total = yInfo + (showInfo ? INFO_H : 0) + 2;
     return {
-      w: avail, ch, canvasW: wCv, x0: pad,
+      w: avail, ch, canvasW: wCv, x0: pad, y0: top,
       ySwatch: yOf.swatch, yRes: yOf.res, yBtn: yOf.actions, yCv, yInfo,
-      rows, blockGap: gap, BW,
-      total: yInfo + INFO_H + 4,
+      rows, blockGap: gap, BW, showInfo, total,
     };
   }
 
@@ -622,6 +648,7 @@ function buildGridCanvasWidget(node) {
   }
 
   function drawInfo(ctx, L) {
+    if (L && L.showInfo === false) return;   //: 高度不够 ⇒ 宁可裁掉状态行，也不溢出行外
     const used = {};
     for (const k in state.cells) used[state.cells[k]] = (used[state.cells[k]] || 0) + 1;
     const parts = Object.keys(used).sort((a, b) => MASKIDX[a] - MASKIDX[b])
@@ -643,11 +670,20 @@ function buildGridCanvasWidget(node) {
   }
 
   //: 真正的绘制入口。两条调用路径（见文件头注释）只共享 width 是可信的。
-  function draw(ctx, n, width) {
+  function draw(ctx, n, width, y, drawH) {
     if (!ctx) return 0;
-    const L = layout(width);
+    //: ⭐ 顶部锚定：litegraph 给的 y 就是这一行的起点（老式 canvas widget 会传第 4 个参数）。
+    //:    Vue 那条路径传的是固定值 1，也是有效起点。
+    //: 高度预算：
+    //: ⚠️ 老式 canvas widget 这条路径里，litegraph 传进来的 `height` 是 **NODE_WIDGET_HEIGHT(=20)**，
+    //:    不是"分配给我们的行高"——实测照它裁会把画布压成 24px（白区只剩 23px 高）。
+    //:    所以预算只取**节点体高**（bodyHeight），并保证不小于我们需要的自然高。
+    const yTop = Number.isFinite(y) && y >= 0 ? Math.round(y) : 0;
+    const availH = Math.max(contentNaturalH(), bodyRoomFrom());
+    const L = layout(width, yTop, availH, drawH);
     //: ⚠️ 记下"真实可用宽度"，computeSize 要用**同一个值**（同一值 ⇒ 不会溢出/叠行）
     lastDrawnW = L.w;
+    lastDrawArgs = { width: L.w, y: yTop, height: drawH, total: L.total, availH: availH };
     //: ⚠️ 只有**主画布**的 ctx 才更新"交互用的 layout/ctx"。
     //:    小地图(minimap)之类会拿同一个 widget 在别的 canvas 上再画一遍，若用它的 ctx
     //:    覆盖 state.ctx，重绘就会画错地方/命中框跟着错位（实测点击时灵时不灵的真凶之一）。
@@ -672,8 +708,12 @@ function buildGridCanvasWidget(node) {
   /* ── 重绘（派生状态变了就调这个；不碰 node.setSize） ── */
   function repaint() {
     syncGrid();
-    const L = state.layout || layout(BASE_W);
-    try { draw(state.ctx, node, L.w); } catch (e) { /* 绘制出错绝不冒泡 */ }
+    const L0 = state.layout || ensureLayout();
+    //: ⚠️ 优先用**主画布当前**的 ctx：state.ctx 可能是别的 canvas/上一次渲染留下的，
+    //:    用它重绘会画到看不见的画布上（用户看到的就是"点了没反应"）。
+    let ctx = null;
+    try { ctx = (app.canvas && app.canvas.ctx) || state.ctx; } catch (e) { ctx = state.ctx; }
+    try { if (ctx) draw(ctx, node, L0.w, L0.y0, L0.total); } catch (e) { /* 绘制出错绝不冒泡 */ }
     //: 高度随宽高比变化时同步给 litegraph（命中测试 getWidgetOnPos 用 computedHeight）
     try { widget.computedHeight = contentH(); } catch (e) {}
     try { node.graph && node.graph.setDirtyCanvas(true, true); } catch (e) {}
@@ -696,9 +736,30 @@ function buildGridCanvasWidget(node) {
   //:    此时点画布会静默无反应（用户看到的就是"点不动"）。所以鼠标入口必须能自算布局。
   function ensureLayout() {
     if (state.layout) return state.layout;
-    const L = layout(BASE_W);
+    //: 兜底也**锚定在 litegraph 给出的行起点**（widget.y），不自己假设原点
+    const w = find("grid_canvas");
+    const wy = Number.isFinite(w && w.y) && w.y >= 0 ? Math.round(w.y) : 0;
+    const L = layout(BASE_W, wy, bodyRoomFrom(), Infinity);
     state.layout = L;
     return L;
+  }
+
+  /* ⭐ 命中判断专用：**每次都用 widget.y 现算一份 layout**，绝不信任可能过期的缓存。
+   * 缓存里的 y0 可能是别的行起点/aarrange 中间态，导致"点上去落进了 width/height 那些行"。 */
+  function freshLayoutForHit() {
+    const w = find("grid_canvas");
+    const wy = Number.isFinite(w && w.y) && w.y >= 0 ? Math.round(w.y) : 0;
+    //: 只用于命中，不改写 state.layout（避免破坏绘制用的那一份）
+    return layout(lastDrawnW || BASE_W, wy, bodyRoomFrom(), Infinity);
+  }
+
+  //: 节点体还剩下多少高度可用（y 之上已经占掉的部分不算）——用于"宁裁状态行也别溢出行外"
+  function bodyRoomFrom() {
+    try {
+      const bh = Number(node && node.size && node.size[1]);
+      if (Number.isFinite(bh) && bh > 0) return Math.round(bh);
+    } catch (e) {}
+    return Infinity;
   }
 
   /* ── 画布矩形命中：只用**我们自己的** layout（不碰 litegraph 的 getWidgetOnPos/last_y） ──
@@ -706,8 +767,7 @@ function buildGridCanvasWidget(node) {
    * 所以改用**节点级鼠标事件**（node.onMouseDown/Move/Up，pos 就是节点内坐标），
    * 命中判断完全由下面的矩形决定。 */
   function hitCanvas(x, yNodeLocal) {
-    ensureLayout();
-    const L = state.layout;
+    const L = freshLayoutForHit();
     if (!L) return null;
     //: 命中矩形 = state.layout 里的画布区（与 draw 的坐标同一套）
     if (yNodeLocal < L.yCv || yNodeLocal > L.yCv + L.ch) return null;
@@ -721,9 +781,36 @@ function buildGridCanvasWidget(node) {
   /* ─────────────────── 鼠标处理（**节点级**，不再用 widget.mouse） ─────────────────── */
   /* litegraph 会把节点内坐标的鼠标事件交给 node.onMouseDown/Move/Up；
    * 返回 true ⇒ 吃掉事件（不会被当成"拖节点"）；返回 false ⇒ 放行给节点拖动/其它 widget。 */
+  /* ── 空闲收笔（不依赖 onMouseUp！） ──
+   * 实测：这条渲染路径上 `onMouseUp` **根本不派发**（down 3/3、up 0/3），
+   * 所以"松手才写 regions"永远不成立。改成：
+   *   按下 ⇒ 当场涂/擦并**立即提交**（单击永远可用）；
+   *   拖动 ⇒ 只重绘 + 节流提交；
+   *   连续 220ms 没有新的 move ⇒ 视为收笔 ⇒ 提交一次并结束这一笔。 */
+  const IDLE_MS = 220;
+  const THROTTLE_MS = 150;
+  let idleTimer = null, lastCommit = 0;
+  function commitStroke() {
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+    if (!state.painting) return;
+    state.painting = false;
+    lastCommit = 0;
+    try { push(); } catch (e) {}
+  }
+  function armIdle() {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => { idleTimer = null; commitStroke(); }, IDLE_MS);
+  }
+  function throttleCommit() {
+    const now = Date.now();
+    if (now - lastCommit >= THROTTLE_MS) {
+      lastCommit = now;
+      try { setRegionsTextQuiet(toRegions(state.cells, grid().cols, grid().rows)); } catch (e) {}
+    }
+  }
+
   function handleMouse(type, x, y, e) {
-    ensureLayout();
-    const L = state.layout;
+    const L = freshLayoutForHit();
     if (!L) return false;
 
     if (type === "pointerdown" || type === "mousedown") {
@@ -752,7 +839,11 @@ function buildGridCanvasWidget(node) {
         const forceErase = !!e.shiftKey || e.button === 2 || e.which === 3;
         state.erase = forceErase || state.cells[k] === state.active;
         if (state.erase) delete state.cells[k]; else state.cells[k] = state.active;
-        repaint();   //: 拖动中**只重绘**，松手才写 regions（细格时字符串几千段）
+        //: ⭐ **按下即提交**：单击永远生效，不需要 onMouseUp
+        setRegionsTextQuiet(toRegions(state.cells, grid().cols, grid().rows));
+        lastCommit = Date.now();
+        armIdle();
+        repaint();   //: 拖动中**只重绘**；regions 走节流/空闲提交
         return true;
       }
       return false;               //: 点在节点上但不是画布/按钮 ⇒ 放行（可拖节点）
@@ -767,7 +858,9 @@ function buildGridCanvasWidget(node) {
           if (erase) delete state.cells[p.c + "," + p.r];
           else state.cells[p.c + "," + p.r] = state.active;
           repaint();
+          throttleCommit();   //: 拖动中节流写 regions（细格时字符串几千段，别每像素写）
         }
+        armIdle();            //: 有新移动 ⇒ 重新计时（空闲 220ms 才算收笔）
       } else {
         const p = cellAt(x, y);
         const same = (p && state.hover && p.c === state.hover.c && p.r === state.hover.r) || (!p && !state.hover);
@@ -778,11 +871,8 @@ function buildGridCanvasWidget(node) {
     }
 
     if (type === "pointerup" || type === "mouseup" || type === "pointercancel") {
-      if (state.painting) {
-        state.painting = false;
-        push();      //: 松手才写 regions
-        return true;
-      }
+      //: 有 up 就用它作为额外提交点；但**功能不依赖它**（空闲定时器已经保证了）
+      if (state.painting) { commitStroke(); return true; }
       return;
     }
 
@@ -822,6 +912,15 @@ function buildGridCanvasWidget(node) {
   node.onMouseDown = function (e, pos, canvas) {
     let r = false;
     try { r = handleMouse("pointerdown", pos ? pos[0] : 0, pos ? pos[1] : 0, e || {}); } catch (er) { r = false; }
+    //: ⭐ 诊断打印（本轮要求）：区分"事件没派发" vs "派发了但我们没命中"
+    try {
+      const L = state.layout;
+      console.log("[grid_node_widget] onMouseDown", {
+        pos: pos ? [Math.round(pos[0]), Math.round(pos[1])] : null,
+        claimed: !!r,
+        layout: L ? { yCv: L.yCv, ch: L.ch, canvasW: L.canvasW, y0: L.y0, total: L.total } : null,
+      });
+    } catch (er) {}
     if (r) { if (e && e.stopPropagation) { try { e.stopPropagation(); } catch (er) {} } return true; }
     return chainDown ? chainDown.call(this, e, pos, canvas) : false;
   };
@@ -918,12 +1017,35 @@ function buildGridCanvasWidget(node) {
     } catch (e) { /* 同步出错不能让整张图渲染挂掉 */ }
   };
 
+  /* ── 高度兜底：节点体高不够就**一次性**调够（⚠️ 绝不在 onResize 里 setSize） ── */
+  function ensureNodeTallEnough() {
+    try {
+      const need = contentH() + (Number.isFinite(Number(node.size && node.size[0])) ? 0 : 0);
+      const cur = Number(node.size && node.size[1]);
+      //: 节点体高 = size[1]；widget 从 node.size[1] 之前的行开始，所以留一点余量
+      if (!Number.isFinite(cur) || cur < need + 40) {
+        node.size = [node.size && node.size[0] || BASE_W, Math.max(320, need + 60)];
+      }
+    } catch (e) {}
+  }
+
+  //: 只读调试出口：给自动化验收核对"声明的行高 == 实际绘制总高"
+  try {
+    window.__GRID_LAYOUT__ = () => ({
+      computeSize: widget.computeSize(),
+      layout: state.layout ? { y0: state.layout.y0, yCv: state.layout.yCv, total: state.layout.total, ch: state.layout.ch, showInfo: state.layout.showInfo } : null,
+      drawArgs: lastDrawArgs,
+      nodeSize: node.size,
+    });
+  } catch (e) {}
+
   /* ── 初始化 ── */
   //: ⚠️ 顺序很重要：**先自愈坏值**，再算几何/画第一次。
   //:    实测老工作流里 width="自定义"、cell=1536 这种坏值，若不自愈，
   //:    NaN 会一路传到 computeSize()，画布整块画不出来。
   healNumericWidgets();
   syncGrid();
+  ensureNodeTallEnough();   //: 高度兜底：不够就一次性调够（不在 onResize 里调）
   //: 节点尺寸兜底：老工作流里可能是 [560, null]（NaN 被 JSON 成了 null），
   //: null 尺寸会让 litegraph 的布局出 NaN。只在明显不合法时才动。
   if (!Array.isArray(node.size) || !Number.isFinite(node.size[0]) || !Number.isFinite(node.size[1])
