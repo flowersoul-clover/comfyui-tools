@@ -26,6 +26,16 @@ ASPECTS = {
 }
 
 
+def half_up(x):
+    """`int(x + 0.5)` —— **必须**与前端 JS 的 `Math.floor(x + 0.5)` 同式。
+
+    为什么不能用 python 内置 `round()`：它是银行家舍入（round(0.5)=0、round(1.5)=2、
+    round(2.5)=2），而 JS 的 `Math.round` 是 half-up ⇒ 格线/色块边界会差 1px，
+    用户拿到的 mask 边缘就会和画布上看到的差一格像素。
+    """
+    return int(x + 0.5)
+
+
 def parse_regions(spec):
     """`"red 1 2 4 9; green 6 2 9 9"` → `[("red",1,2,4,9), …]`（坏行直接跳过，不炸）。"""
     out = []
@@ -45,7 +55,11 @@ def parse_regions(spec):
 
 
 class GridMaskEditor:
-    """白底（或你给的背景图）上按格涂硬边色块 ⇒ 输出一张图像，直接喂 `MaskFromRGBCMYBW+`。"""
+    """白底上按格涂硬边色块 ⇒ 输出一张图像，直接喂 `MaskFromRGBCMYBW+`。
+
+    ⚠️ 底图（`background` / `background_file`）**只作参考、只用来定宽高**，
+    **不会**出现在输出里 —— 底图像素会污染按阈值拆色的 8 个通道。详见 `draw()`。
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -59,9 +73,9 @@ class GridMaskEditor:
                 "regions": ("STRING", {"multiline": True, "default": "red 1 2 4 9 ; green 6 2 9 9",
                                        "tooltip": "颜色 列起 行起 列止 行止（半开区间）· 颜色见节点说明"}),
                 "show_grid": ("BOOLEAN", {"default": True, "tooltip": "画浅灰格子线（只为好看，不影响拆色）"}),
-                "background_file": ("STRING", {"default": "", "tooltip": "底图文件名（ComfyUI input 目录里）—— widget 里'上传底图'会自动填；留空=白底"}),
+                "background_file": ("STRING", {"default": "", "tooltip": "底图文件名（ComfyUI input 目录里）—— widget 里'上传底图'会自动填。**仅作参考并决定宽高，不进输出**"}),
             },
-            "optional": {"background": ("IMAGE", {"tooltip": "想参考真实图就接进来（会铺在底下，网格涂在上面）"})},
+            "optional": {"background": ("IMAGE", {"tooltip": "想照着描就接进来（只作参考 + 决定宽高，**不会**出现在输出里）"})},
         }
 
     RETURN_TYPES = ("IMAGE",)
@@ -73,12 +87,20 @@ class GridMaskEditor:
 
     def draw(self, width, height, cell, regions, show_grid=True,
              background_file="", background=None):
+        """输出 = **纯硬边色块图**（白底 + 涂的格子）。
+
+        ⚠️ 底图（`background` 输入 / `background_file`）**只用来定尺寸**，绝不进输出。
+        为什么：`MaskFromRGBCMYBW+` 是按阈值拆色的 —— 白 = mask7、黑 = mask6，
+        其余 6 个通道各有自己的阈值；把底图铺进去，底图像素会**随机落进这些通道**
+        （深色头发 → black 档、亮背景 → white 档），等于凭空多出一堆假 mask。
+        底图仅在**节点画布上**做半透明参考，方便你照着描。
+        """
         width, height, cell = int(width), int(height), max(8, int(cell))
-        bg = None
-        if background is not None:                        #: ② 有底图 ⇒ **用底图自己的尺寸**（不拉伸）
-            bg = background[:1]
-            _, hh, ww, _ = bg.shape
+        #: ① `background` 输入（IMAGE）⇒ 只用它自己的尺寸（不拉伸），内容**不参与**输出
+        if background is not None:
+            _, hh, ww, _ = background[:1].shape
             width, height = int(ww), int(hh)
+        #: ② `background_file`（节点"上传底图"写进去的文件名）⇒ 同样只取尺寸
         elif str(background_file or "").strip():
             try:
                 import os
@@ -87,46 +109,39 @@ class GridMaskEditor:
                 fp = os.path.join(folder_paths.get_input_directory(),
                                   os.path.basename(str(background_file).strip()))
                 if os.path.exists(fp):
-                    im = Image.open(fp).convert("RGB")
-                    width, height = im.size                #: ② 同上：按底图尺寸
-                    bg = torch.from_numpy(np.asarray(im, dtype=np.float32) / 255.0).unsqueeze(0)
-                    print("[GridMaskEditor] 底图 %s ⇒ 尺寸改为 %dx%d（不拉伸）" % (os.path.basename(fp), width, height))
+                    with Image.open(fp) as im:
+                        width, height = im.size
+                    print("[GridMaskEditor] 底图 %s ⇒ 尺寸改为 %dx%d（不拉伸；底图仅作参考，不进输出）"
+                          % (os.path.basename(fp), width, height))
             except Exception as exc:
                 print("[GridMaskEditor] 读底图失败:", type(exc).__name__)
         #: ⚠️ 这里**不再看 aspect**（2026-10-13 修的 bug A）：宽高以 `width/height` 为准，
         #: 预设按钮只由**节点的画布 widget** 负责改这两个值 —— 否则手改宽高会被预设悄悄改回去。
-        if background is None and str(background_file or "").strip():
-            try:                                      #: 从 ComfyUI input 目录读底图（"导入底图"那条路）
-                import os
-                from PIL import Image
-                import folder_paths
-                fp = os.path.join(folder_paths.get_input_directory(), os.path.basename(str(background_file).strip()))
-                if os.path.exists(fp):
-                    arr = np.asarray(Image.open(fp).convert("RGB"), dtype=np.float32) / 255.0
-                    background = torch.from_numpy(arr).unsqueeze(0)
-                    print("[GridMaskEditor] 底图: %s (%dx%d)" % (os.path.basename(fp), arr.shape[1], arr.shape[0]))
-            except Exception as exc:
-                print("[GridMaskEditor] 读底图失败:", type(exc).__name__)
-        #: 格数四舍五入用 **half-up**（int(x+0.5)），与前端 JS 的 Math.round 逐格一致；
+        #: 格数四舍五入用 **half-up**（int(x+0.5)），与前端 JS 的 Math.floor(x+0.5) 逐格一致；
         #: python 的 round() 是银行家舍入 —— round(1344/128)=round(10.5)=10，而前端画 11 列 ⇒ 错位
         cols, rows = max(1, int(width / cell + 0.5)), max(1, int(height / cell + 0.5))
+        #: ⭐ 底色**恒为白**：白 = mask7，是"什么都没画"的基准档，不会给拆色添假 mask
         canvas = np.full((height, width, 3), 255, dtype=np.uint8)
-        if bg is not None:                              #: 底图 1:1 铺底 —— **绝不缩放**（尺寸已按底图设好）
-            canvas = (bg[0].clamp(0, 1).cpu().numpy() * 255).astype(np.uint8).copy()
         for name, c0, r0, c1, r1 in parse_regions(regions):
             x0, x1 = sorted((max(0, min(cols, c0)), max(0, min(cols, c1))))
             y0, y1 = sorted((max(0, min(rows, r0)), max(0, min(rows, r1))))
             if x1 <= x0 or y1 <= y0:
                 continue
             #: 按格对齐、**硬边**填充（不羽化 —— 拆色是按阈值比三通道的）
-            px0, px1 = round(x0 * width / cols), round(x1 * width / cols)
-            py0, py1 = round(y0 * height / rows), round(y1 * height / rows)
+            #: ⭐ 边界与前端逐像素一致：JS 的 `Math.round` 是 half-up（0.5 进位），
+            #:    python 的 `round` 是银行家舍入（round(0.5)=0、round(2.5)=2）⇒ 会差 1px。
+            #:    实测 case(64,3): 前端格线在 352，python 原本画在 349.5→350（差 2px）。
+            px0, px1 = half_up(x0 * width / cols), half_up(x1 * width / cols)
+            py0, py1 = half_up(y0 * height / rows), half_up(y1 * height / rows)
             canvas[py0:py1, px0:px1] = COLORS[name]
-        if show_grid:                                   # 浅灰格线（离黑/白/纯色都够远，不影响阈值）
+        if show_grid:                                   # 格线 **纯白**：白色是"没涂"的基准档
+            #: ⚠️ 曾经用 (210,210,210)：它本身不落在 black/white 任一档（阈值 0.15 ⇒ 需要 ≤38 或 ≥217），
+            #:    但格线是**后画**的、会从色块里抠掉 1px 宽的缝 ⇒ 抠出来的缝算进 white 档，
+            #:    用户拿到的 mask 边缘就带一圈白色小孔。改成纯白后格线与白底同档，缝不再"凭空出现"。
             for c in range(1, cols):
-                canvas[:, min(width - 1, round(c * width / cols))] = (210, 210, 210)
+                canvas[:, min(width - 1, half_up(c * width / cols))] = (255, 255, 255)
             for r in range(1, rows):
-                canvas[min(height - 1, round(r * height / rows)), :] = (210, 210, 210)
+                canvas[min(height - 1, half_up(r * height / rows)), :] = (255, 255, 255)
         t = torch.from_numpy(canvas.astype(np.float32) / 255.0).unsqueeze(0)
         print("[GridMaskEditor] %dx%d · %d×%d 格 · 涂了 %d 段" % (width, height, cols, rows,
                                                                   len(parse_regions(regions))))

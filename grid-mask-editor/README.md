@@ -27,7 +27,7 @@ The colours are **not arbitrary**: `MaskFromRGBCMYBW+` (from [ComfyUI_essentials
 - **Grid resolution**: `256 / 128 / 64 / 32 / 16 / 8` px per cell (default 128). Picking a finer grid **keeps what you already painted** (coarse → refine).
 - **Undo**: one continuous drag = one step (button + `Ctrl+Z`).
 - **Aspect presets**: `16:9 3:2 4:3 1:1 3:4 2:3 9:16`.
-- **Import a background**: upload an image, it becomes the canvas backdrop, and **width/height snap to that image** (never stretched) so you can trace it.
+- **Import a background**: upload an image and it becomes a **semi-transparent reference underlay** on the node canvas, and **width/height snap to that image** (never stretched) so you can trace it. ⚠️ **The background is reference only — it never appears in the output image**, because `MaskFromRGBCMYBW+` splits by thresholds and background pixels would leak into the masks (dark hair → `black`, bright sky → `white`).
 - **Semi-transparent overlay** on screen, but the emitted image is **hard-edged and opaque** (thresholoding needs exact colours).
 - **`regions` text is the single source of truth** — you can also type it:
   `"red 1 2 4 9 ; green 6 2 9 9"` = `colour col_start row_start col_end row_end`, half-open, 0-based.
