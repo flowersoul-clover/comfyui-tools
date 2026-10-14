@@ -494,25 +494,39 @@ function buildGridCanvasWidget(node) {
    *     并把 backing store 钉成 clientWidth×(total+2) —— 否则元素 CSS 高度随 zoom 拉伸，
    *     画布会溢出节点、命中也偏。
    *   经典模式：y = 本行顶边在节点体内的偏移，ctx 只平移到节点左上角
-   *     ⇒ 必须自己 translate(0, y)（这版 litegraph 不会替 widget 平移）。 */
+   *     ⇒ 必须自己 translate(0, y)（这版 litegraph 不会替 widget 平移）。
+   * ⭐ 第三个调用方（2026-10-14 实测根因）：选中节点后右侧参数面板也会用 WidgetLegacy
+   *   画这个 widget（面板宽 ~190px）。WidgetLegacy.draw 会把**视觉宽**写进 widget.width，
+   *   而经典 drawWidgets 用 `widget.width || renderingSize[0]` 当行宽 ⇒ 面板画过一次后，
+   *   节点体的经典绘制就收到小宽度（画布缩成左上角一小块、下面大片空白）。对策：
+   *   - 经典路径：传入宽度比节点窄时以节点宽为准；
+   *   - 面板绘制（元素宽明显比节点窄）：照画（面板里留个迷你预览），但**不覆盖**命中布局。 */
   function draw(ctx, n, width, y, drawH) {
     if (!ctx) return 0;
     const isVue = Number.isFinite(y) && y <= 2;
     const el = ctx.canvas;
+    const nodeW = Math.round(Number(n && n.size && n.size[0]) || 0);
     let wDraw = finiteInt(width, BASE_W, 160, 8192);
+    let panelDraw = false;
     if (isVue && el) {
       const cw = Math.round(Number(el.clientWidth) || 0);
       if (cw >= 160) wDraw = cw;
+      else if (nodeW >= 160) wDraw = nodeW;   //: 元素还没排版好时，别用随 zoom 变的视觉宽
+      panelDraw = nodeW > 0 && cw >= 160 && cw < nodeW - 40;
       const L0 = layout(wDraw);
       const bw = Math.round(wDraw * 2), bh = Math.round((L0.total + 2) * 2);   //: scaleFactor=2（同 WidgetLegacy）
       if (el.width !== bw || el.height !== bh) { el.width = bw; el.height = bh; }
       ctx.setTransform(2, 0, 0, 2, 0, 0);   //: 改 width/height 会重置 ctx 状态 ⇒ 每次都重设
+    } else if (!isVue && nodeW > wDraw) {
+      wDraw = nodeW;   //: widget.width 被面板污染时经典路径会收到小宽度 ⇒ 以节点宽为准
     }
     const yTop = isVue ? 0 : (Number.isFinite(y) && y >= 0 ? Math.round(y) : 0);
     const L = layout(wDraw);
-    lastDrawnW = L.w;
-    lastDrawArgs = { width: L.w, y: yTop, height: drawH, total: L.total, vue: isVue };
-    state.layout = L;
+    if (!panelDraw) {   //: 面板的迷你预览不覆盖节点体的命中布局（否则点击全点歪）
+      lastDrawnW = L.w;
+      lastDrawArgs = { width: L.w, y: yTop, height: drawH, total: L.total, vue: isVue };
+      state.layout = L;
+    }
     ctx.save();
     ctx.translate(0, yTop);
     ctx.beginPath(); ctx.rect(0, 0, L.w, L.total); ctx.clip();   //: 只在分配给我们的行内绘制
@@ -659,9 +673,10 @@ function buildGridCanvasWidget(node) {
       const isVueEvt = !!(t && t.tagName === "CANVAS" && t !== main && t.clientWidth > 0);
       let hx, hy;
       if (isVueEvt) {
-        //: Vue 模式：pos = widget 元素局部 CSS 像素（元素随 zoom 拉伸 ⇒ 换回绘制坐标）
+        //: Vue 模式：pos = widget 元素局部 CSS 像素（元素随 zoom 有拉伸 ⇒ 换回绘制坐标）
         const L = state.layout;
         if (!L) return false;
+        if (t.clientWidth < L.w - 40) return false;   //: 侧边参数面板的迷你画布只看，不涂
         const fx = L.w / t.clientWidth, fy = L.total / (t.clientHeight || L.total);
         hx = pos[0] * fx; hy = pos[1] * fy;
       } else {
