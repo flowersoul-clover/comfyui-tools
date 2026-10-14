@@ -563,11 +563,16 @@ function buildGridCanvasWidget(node) {
     } else if (!isVue && nodeW > wDraw) {
       wDraw = nodeW;   //: widget.width 被面板污染时经典路径会收到小宽度 ⇒ 以节点宽为准
     }
+    /* ⭐ 第四坑（2026-10-14 实测）：前端命中判定 `getWidgetOnPos` 里宽度取
+     *    `u = widget.width || node.size[0]`。选中节点后右侧参数面板会用 WidgetLegacy 画一次
+     *    这个 widget，把**面板的视觉宽**（实测 274.8px）写进 `widget.width`；节点体的经典路径
+     *    虽然收到了正确的行宽，`widget.width` 却留在 274.8 ⇒ 命中矩形宽度只有 275px，
+     *    画布右半边的点击全部落空（实测表现：点左边第一格能中，点右边一律没反应）。
+     *    对策：**经典路径**（行宽 ≥ 节点宽，说明画的就是节点体）把它清成 null，让前端退回节点宽；
+     *    面板自己也照常重写一次，面板里的迷你预览不受影响。 */
+    if (!isVue && wDraw >= nodeW) { try { widget.width = null; } catch (e) {} }
     const yTop = isVue ? 0 : (Number.isFinite(y) && y >= 0 ? Math.round(y) : 0);
     const L = layout(wDraw, hAvail);
-    //: ⚠️ 同时把 `last_y` 钉成 `y` —— 前端 `getWidgetOnPos` 的命中矩形读的是 `last_y`，
-    //:    而这条渲染路径不会刷新它（详见 rowTop() 的注释）。
-    rowTop();
     if (!panelDraw) {   //: 面板的迷你预览不覆盖节点体的命中布局（否则点击全点歪）
       lastDrawnW = L.w;
       lastDrawArgs = { width: L.w, y: yTop, height: drawH, total: L.total, vue: isVue };
@@ -609,7 +614,6 @@ function buildGridCanvasWidget(node) {
   const rowTop = () => {
     const w = find("grid_canvas");
     if (!w) return 0;
-    try { if (Number.isFinite(w.y) && w.last_y !== w.y) w.last_y = w.y; } catch (e) {}
     const y = (w.last_y !== undefined && w.last_y !== null) ? w.last_y : w.y;
     return Number.isFinite(y) && y >= 0 ? Math.round(y) : 0;
   };
@@ -786,6 +790,25 @@ function buildGridCanvasWidget(node) {
     if (cw2) { try { cw2.serialize = false; } catch (e) {} try { if (cw2.options) cw2.options.serialize = false; } catch (e) {} }
   }
 
+  /* ── ⭐ 让命中矩形坐标对"y 被清零"免疫（2026-10-14 实测第三个坑） ──
+   * 本机前端的命中判定 `getWidgetOnPos` 只认 `widget.last_y`，而这个值会在节点被选中后
+   * 被某条绘制路径写成 0（实测：点第一下 `last_y=290` 命中正常，之后 `y`/`last_y` 变 0，
+   * 于是**第二次点击开始全部点不动** —— 只有第一下生效）。
+   * 这里给 `last_y` 装一层守卫：拒绝 ≤0 的写入（那是"行内坐标"而不是"节点体坐标"），
+   * 只接受真正的节点体内位置。这样命中矩形始终落在画布上，不管 y 怎么被清零。 */
+  let liveLastY = 0;
+  try {
+    Object.defineProperty(widget, "last_y", {
+      configurable: true, enumerable: true,
+      get() { return liveLastY; },
+      set(v) {
+        const n = Number(v);
+        if (!Number.isFinite(n) || n <= 0) return;      //: 拒绝"行内坐标"式清零
+        liveLastY = n;
+      },
+    });
+  } catch (e) { /* 不支持就算了，只是命中可能偏 */ }
+
   node.addCustomWidget(widget);   //: ⭐ 画布**最后**加 ⇒ 排在所有输入行下面
 
   /* ── 外部改动同步：包 width/height/cell/background_file 的 callback ──
@@ -897,20 +920,35 @@ function buildGridCanvasWidget(node) {
   };
 
   /* ── 节点边界贴内容（2026-10-14 用户反馈"2048 固定节点太大"）：
-   * 节点宽必须**至少**装得下自然画布（否则画布被裁掉）；用户手动拖得更宽时保留他的宽度
-   * （多出来的空间在行内居中），只有"窄到装不下"时才被拉宽 —— 与 `expandToFitContent` 同语义。
-   * 高度**不再自算**：`_arrangeWidgets` 已经用 `computeSize()[1]` 把节点高设成"所有行累计高"，
-   * 我们再算一遍只会多出一个偏移量（实测曾多出 294px 空白）。
+   * 宽度：必须**至少**装得下自然画布；用户手动拖得更宽时保留他的宽度（空白在行内居中）。
+   * 高度：必须**至少**装得下"所有 widget 行的累计高"。本来 `_arrangeWidgets` 会做这件事，
+   *      但它只在节点被 setSize/重排时跑；改宽高/cell/底图之后画布行变高、节点却不跟着长
+   *      ⇒ 画布下面那截落在**节点体之外**，于是"点第二下开始就点不动了"（实测：一次会话里
+   *      只有第一下生效，因为第一下靠的是节点体外的绘制，第二下 hit test 直接判定没命中）。
+   *      所以这里自己把高度也算准并 setSize，让它重新走一遍 _arrangeWidgets。
+   * 公式：表头偏移（= 画布行 y 减去它前面各行的累计高）+ 各行累计高 + 底部余量。
    * ⚠️ 绝不在 onResize 里调它（onResize→setSize→onResize 无限递归，实测搞挂过工作流加载）。 ── */
-  const ROW_PAD = 4;
   function fitNode() {
     try {
       const n = naturalCanvas();
-      const w = Math.max(MIN_W, n.canvasW + 12);
+      const wantW = Math.max(MIN_W, n.canvasW + 12);
+      const cw = find("grid_canvas");
+      const vis = (node.widgets || []).filter((w) => !w.hidden);
+      let sum = 0, before = 0, seen = false;
+      for (const w of vis) {
+        if (w === cw) { before = sum; seen = true; }
+        sum += (typeof w.computedHeight === "number" ? w.computedHeight : 20);
+      }
+      let wantH = 0;
+      if (seen && cw) {
+        const startY = (Number.isFinite(cw.y) && cw.y > sum - before) ? (cw.y - before) : 26;
+        wantH = Math.round(startY + sum + 4);
+      }
+      if (!(wantH > 200)) wantH = Math.round(n.ch + 380);          //: 还没排过版 ⇒ 粗估兜底
       const curW = Math.round(Number(node.size && node.size[0]) || 0);
       const curH = Math.round(Number(node.size && node.size[1]) || 0);
-      if (curW >= w && curH >= 200) return;     //: 已经装得下 ⇒ 不动（幂等，别白白 setSize）
-      node.setSize([Math.max(curW, w), curH >= 200 ? curH : Math.round(n.ch + 360)]);
+      if (curW >= wantW && curH >= wantH) return;                  //: 已经装得下 ⇒ 不动（幂等）
+      node.setSize([Math.max(curW, wantW), Math.max(curH, wantH)]);
     } catch (e) {}
   }
 
