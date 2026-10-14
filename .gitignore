@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+.kimi_session/
+.DS_Store
+Thumbs.db
