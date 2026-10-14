@@ -32,6 +32,24 @@ The colours are **not arbitrary**: `MaskFromRGBCMYBW+` (from [ComfyUI_essentials
 - **`regions` text is the single source of truth** — you can also type it:
   `"red 1 2 4 9 ; green 6 2 9 9"` = `colour col_start row_start col_end row_end`, half-open, 0-based.
 
+## Outputs
+
+| output | type | use |
+|---|---|---|
+| `grid` | IMAGE | wire into `MaskFromRGBCMYBW+` |
+| `width` | INT | wire straight into `EmptyLatentImage.width` |
+| `height` | INT | wire straight into `EmptyLatentImage.height` |
+
+`width`/`height` are the **authoritative** size of the emitted grid — when a background is loaded the
+node reports the *image's* size (the `width`/`height` widgets are overridden by it), so connecting
+these two keeps your latent in sync with your masks instead of you retyping numbers.
+In the UI: click the dot on the `EmptyLatentImage` width/height widgets to turn them into inputs,
+then drag from `GridMaskEditor.width` / `.height`. (The equivalent "read the size back from the
+image" route also works but needs an extra node: `MaskToImage → GetImageSize+ (ComfyUI_essentials) → EmptyLatentImage`.)
+
+> ⚠️ Output **order is part of the saved-workflow format** — `grid` is slot 0. If you add more
+> outputs later, append them; never insert.
+
 ## Install
 
 ```bash

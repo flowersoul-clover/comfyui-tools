@@ -78,11 +78,17 @@ class GridMaskEditor:
             "optional": {"background": ("IMAGE", {"tooltip": "想照着描就接进来（只作参考 + 决定宽高，**不会**出现在输出里）"})},
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("grid",)
+    #: ⭐ 顺带把**实际用到的**宽高当 INT 吐出来（2026-10-14 用户要求："我们不是有画幅大小吗，
+    #:    直接把数字连给 latent 不就行了"）—— 这样 `EmptyLatentImage` 的 width/height 直接连
+    #:    这两个输出即可，不用再挂 `GetImageSize+` 反推。
+    #: 注意这两个是**权威值**：`background_file` / `background` 命中时，尺寸是从底图量出来的
+    #: （节点上的 width/height widget 那时会被底图尺寸覆盖），所以连它们比连 widget 更可靠。
+    RETURN_TYPES = ("IMAGE", "INT", "INT")
+    RETURN_NAMES = ("grid", "width", "height")
     FUNCTION = "draw"
     CATEGORY = "mask/grid"
-    DESCRIPTION = ("网格涂色 → 输出 IMAGE（硬边、按格对齐）⇒ 直连 MaskFromRGBCMYBW+。"
+    DESCRIPTION = ("网格涂色 → 输出 IMAGE（硬边、按格对齐）⇒ 直连 MaskFromRGBCMYBW+；"
+                   "另有两个 INT 输出 width/height，直接连 EmptyLatentImage 的宽高。"
                    "颜色顺序固定：red green blue cyan magenta yellow black white")
 
     def draw(self, width, height, cell, regions, show_grid=True,
@@ -145,7 +151,8 @@ class GridMaskEditor:
         t = torch.from_numpy(canvas.astype(np.float32) / 255.0).unsqueeze(0)
         print("[GridMaskEditor] %dx%d · %d×%d 格 · 涂了 %d 段" % (width, height, cols, rows,
                                                                   len(parse_regions(regions))))
-        return (t,)
+        #: width/height 是**这张图实际的像素尺寸**（可能来自底图，而不是 widget 里的值）
+        return (t, int(width), int(height))
 
 
 NODE_CLASS_MAPPINGS = {"GridMaskEditor": GridMaskEditor}
