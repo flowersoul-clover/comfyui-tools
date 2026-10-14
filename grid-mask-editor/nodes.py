@@ -53,8 +53,9 @@ class GridMaskEditor:
             "required": {
                 "width": ("INT", {"default": 1216, "min": 64, "max": 4096, "step": 32}),
                 "height": ("INT", {"default": 704, "min": 64, "max": 4096, "step": 32}),
-                "cell": ("INT", {"default": 128, "min": 8, "max": 512,
-                                 "tooltip": "格边长（像素）⇒ 格数 = 宽/格、高/格，自动尽量正方形"}),
+                "cell": ([32, 64, 96, 128, 192, 256],
+                         {"default": 128,
+                          "tooltip": "格边长（像素）⇒ 格数 = 宽/格、高/格，自动尽量正方形"}),
                 "regions": ("STRING", {"multiline": True, "default": "red 1 2 4 9 ; green 6 2 9 9",
                                        "tooltip": "颜色 列起 行起 列止 行止（半开区间）· 颜色见节点说明"}),
                 "show_grid": ("BOOLEAN", {"default": True, "tooltip": "画浅灰格子线（只为好看，不影响拆色）"}),
@@ -106,7 +107,9 @@ class GridMaskEditor:
                     print("[GridMaskEditor] 底图: %s (%dx%d)" % (os.path.basename(fp), arr.shape[1], arr.shape[0]))
             except Exception as exc:
                 print("[GridMaskEditor] 读底图失败:", type(exc).__name__)
-        cols, rows = max(1, round(width / cell)), max(1, round(height / cell))
+        #: 格数四舍五入用 **half-up**（int(x+0.5)），与前端 JS 的 Math.round 逐格一致；
+        #: python 的 round() 是银行家舍入 —— round(1344/128)=round(10.5)=10，而前端画 11 列 ⇒ 错位
+        cols, rows = max(1, int(width / cell + 0.5)), max(1, int(height / cell + 0.5))
         canvas = np.full((height, width, 3), 255, dtype=np.uint8)
         if bg is not None:                              #: 底图 1:1 铺底 —— **绝不缩放**（尺寸已按底图设好）
             canvas = (bg[0].clamp(0, 1).cpu().numpy() * 255).astype(np.uint8).copy()

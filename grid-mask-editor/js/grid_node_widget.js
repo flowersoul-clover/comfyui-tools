@@ -55,7 +55,7 @@ const BASE_W = 560;
 const MIN_W = 640;
 const ROW_GAP = 2;
 const INFO_H = 26;        //: 状态行（两行小字）
-const MAX_CANVAS_H = 1600; //: 画布高度上限（节点已固定 2048 高 ⇒ 放开，让画布随可用高度长）
+const MAX_CANVAS_H = 1600; //: 画布高度上限（竖图时格边长受此约束，画布在行内居中）
 
 /* ───────────────────── 纯数据层：regions ⇄ cells ───────────────────── */
 /* regions 是**唯一真源**；cells 只是它的可视化解码。 */
@@ -224,11 +224,6 @@ function buildGridCanvasWidget(node) {
   }
   const syncGrid = () => { const g = grid(); state.cols = g.cols; state.rows = g.rows; };
   const cellPx = () => finiteInt(W("cell", DEFAULT_CELL), DEFAULT_CELL, 4, 4096);
-  //: 画布高度按宽高比（窄节点的兜底值；实际高度取"剩余空间"，见 layout）
-  const canvasH = () => {
-    const c = grid();
-    return finiteInt(BASE_W * c.rows / c.cols, BASE_W * DEFAULT_H / DEFAULT_W, 48, MAX_CANVAS_H);
-  };
   //: ⚠️ computeSize()/Vue 的容器高 直接吃这个 ⇒ 必须保证是有限正整数
   const contentH = () => {
     try {
@@ -309,10 +304,14 @@ function buildGridCanvasWidget(node) {
   }
 
   /* ── 底图 ── */
-  const loadBg = (name) => {
+  const loadBg = (name, adapt) => {
     if (!name) { state.bgImg = null; repaint(); return; }
     const img = new Image();
-    img.onload = () => { state.bgImg = img; repaint(); };
+    img.onload = () => {
+      state.bgImg = img;
+      if (adapt) applySize(img.naturalWidth, img.naturalHeight);   //: 手填/上传底图 ⇒ 画布跟着底图走
+      else repaint();   //: 工作流还原时不动已保存的宽高
+    };
     img.onerror = () => { state.bgImg = null; };
     img.src = "/view?filename=" + encodeURIComponent(name) + "&type=input";
   };
@@ -396,20 +395,26 @@ function buildGridCanvasWidget(node) {
    *    所以这里绝不能把 y0 混进 total。 */
   function layout(width) {
     const w = finiteInt(width, BASE_W, 160, 8192);
-    //: 画布高度：剩下的空间都给画布（节点 2048 高 ⇒ 画布随高度长）
+    const g = grid();
+    /* ⭐ 正方形格（2026-10-14 用户反馈"长宽比失调/底图对不上"）：格边长取"行宽放得下、
+     *    剩余高度放得下"的较小值 ⇒ 画布宽高比 == 目标图宽高比，底图 contain 恰好铺满。
+     *    之前 ch=max(自然高, room) 把节点剩余空间全吃掉 ⇒ 格子被拉成细条、底图错位。 */
     const room = Math.max(64, canvasRoomH() - 2 - INFO_H - ROW_GAP);
-    const ch = finiteInt(Math.max(canvasH(), room), 200, 48, MAX_CANVAS_H);
+    const cell = Math.max(2, Math.min((w - 4) / g.cols, Math.min(room, MAX_CANVAS_H) / g.rows));
+    const canvasW = Math.max(80, Math.round(cell * g.cols));
+    const ch = Math.max(48, Math.round(cell * g.rows));
+    const x0 = Math.max(2, Math.round((w - canvasW) / 2));   //: 比行宽窄时（竖图）居中
     const yCv = 2;                                   //: **行内**坐标（行顶 = 0）
     const yInfo = yCv + ch + ROW_GAP;
     return {
-      w, ch, canvasW: Math.max(80, w - 4), yCv, yInfo, showInfo: true,
+      w, ch, canvasW, x0, yCv, yInfo, showInfo: true,
       total: yInfo + INFO_H + 2,
     };
   }
 
   function drawGrid(ctx, L) {
     const { cols, rows } = state;
-    const x0 = 2, y0 = L.yCv;
+    const x0 = L.x0, y0 = L.yCv;
     const cw = L.canvasW / cols, chh = L.ch / rows;
     ctx.save();
     ctx.beginPath(); ctx.rect(x0, y0, L.canvasW, L.ch); ctx.clip();
@@ -536,8 +541,8 @@ function buildGridCanvasWidget(node) {
   function hitCanvas(x, yL) {
     const L = state.layout || layout(widthSource());   //: 还没画过时的兜底
     if (yL < L.yCv || yL > L.yCv + L.ch) return null;
-    if (x < 2 || x > L.canvasW + 2) return null;
-    const c = Math.floor((x - 2) / (L.canvasW / state.cols));
+    if (x < L.x0 || x > L.x0 + L.canvasW) return null;
+    const c = Math.floor((x - L.x0) / (L.canvasW / state.cols));
     const r = Math.floor((yL - L.yCv) / (L.ch / state.rows));
     if (c < 0 || c >= state.cols || r < 0 || r >= state.rows) return null;
     return { c, r };
@@ -730,7 +735,7 @@ function buildGridCanvasWidget(node) {
   wrapCb("width", onExternalGeometry);
   wrapCb("height", onExternalGeometry);
   wrapCb("cell", onExternalGeometry);
-  wrapCb("background_file", (v) => { loadBg(String(v || "").trim()); });
+  wrapCb("background_file", (v) => { loadBg(String(v || "").trim(), true); });
 
   //: litegraph 的 `_arrangeWidgets` 正是用 `computeSize()[1]` 写 computedHeight，
   //: Vue 的 WidgetLegacy 也优先读它 ⇒ 先给一个初始值。
