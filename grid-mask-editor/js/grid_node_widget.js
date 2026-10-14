@@ -55,7 +55,7 @@ const BASE_W = 560;
 const MIN_W = 640;
 const ROW_GAP = 2;
 const INFO_H = 26;        //: 状态行（两行小字）
-const MAX_CANVAS_H = 1600; //: 画布高度上限（竖图时格边长受此约束，画布在行内居中）
+const MAX_CANVAS = 2048; //: 画布边长上限（能包容 2048×2048 底图；竖图超限时格边长被压低、画布在行内居中）
 
 /* ───────────────────── 纯数据层：regions ⇄ cells ───────────────────── */
 /* regions 是**唯一真源**；cells 只是它的可视化解码。 */
@@ -227,8 +227,8 @@ function buildGridCanvasWidget(node) {
   //: ⚠️ computeSize()/Vue 的容器高 直接吃这个 ⇒ 必须保证是有限正整数
   const contentH = () => {
     try {
-      const L = layout(widthSource());
-      return finiteInt(L.total, 64, 64, 16384);
+      const n = naturalCanvas();
+      return finiteInt(2 + n.ch + ROW_GAP + INFO_H + 2, 64, 64, 16384);
     } catch (e) { return 600; }
   };
 
@@ -393,14 +393,21 @@ function buildGridCanvasWidget(node) {
   /* ⚠️ `total` 是**纯行高**（这一行自己有多高），**不含**任何绝对 y。
    *    litegraph 只把 `computeSize()[1]` 当行高用（行顶 y 由它自己累加），
    *    所以这里绝不能把 y0 混进 total。 */
+  //: 自然（不被节点边界夹）画布尺寸：格子按 cell 档位画，画布边长上限 MAX_CANVAS
+  function naturalCanvas() {
+    const g = grid();
+    const c = Math.max(2, Math.min(cellPx(), MAX_CANVAS / g.cols, MAX_CANVAS / g.rows));
+    return { cell: c, canvasW: Math.max(80, Math.round(c * g.cols)), ch: Math.max(48, Math.round(c * g.rows)) };
+  }
+
   function layout(width) {
     const w = finiteInt(width, BASE_W, 160, 8192);
     const g = grid();
-    /* ⭐ 正方形格（2026-10-14 用户反馈"长宽比失调/底图对不上"）：格边长取"行宽放得下、
+    /* ⭐ 正方形格（2026-10-14 用户反馈"长宽比失调/底图对不上"）：格边长取"自然尺寸、行宽放得下、
      *    剩余高度放得下"的较小值 ⇒ 画布宽高比 == 目标图宽高比，底图 contain 恰好铺满。
-     *    之前 ch=max(自然高, room) 把节点剩余空间全吃掉 ⇒ 格子被拉成细条、底图错位。 */
+     *    节点尺寸由 fitNode() 按自然画布贴边 ⇒ 手动拖大节点时空白居中、拖小时格子缩小。 */
     const room = Math.max(64, canvasRoomH() - 2 - INFO_H - ROW_GAP);
-    const cell = Math.max(2, Math.min((w - 4) / g.cols, Math.min(room, MAX_CANVAS_H) / g.rows));
+    const cell = Math.max(2, Math.min(naturalCanvas().cell, (w - 4) / g.cols, room / g.rows));
     const canvasW = Math.max(80, Math.round(cell * g.cols));
     const ch = Math.max(48, Math.round(cell * g.rows));
     const x0 = Math.max(2, Math.round((w - canvasW) / 2));   //: 比行宽窄时（竖图）居中
@@ -663,10 +670,11 @@ function buildGridCanvasWidget(node) {
       }
       return handleMouse(e.type, hx, hy, e);
     },
-    //: ⭐ 声明高度 == 这一行**实际绘制**的总高（同一份 layout() 算出来的，不再二次夹取）
+    //: ⭐ 声明尺寸 == 自然画布尺寸（不受当前节点边界夹）⇒ node.computeSize() 恰好包住内容，
+    //:    fitNode() 靠它把节点边界贴到内容上
     computeSize: () => {
-      const w = widthSource();
-      return [w, layout(w).total];
+      const n = naturalCanvas();
+      return [Math.max(MIN_W, n.canvasW + 8), 2 + n.ch + ROW_GAP + INFO_H + 2];
     },
     onRemove: () => { try { abortKeys.abort(); } catch (e) {} },
   };
@@ -716,6 +724,7 @@ function buildGridCanvasWidget(node) {
     const from = { cols: state.cols, rows: state.rows };
     syncGrid();
     refreshAspect();
+    fitNode();   //: 宽高/cell 变了 ⇒ 节点边界重新贴内容
     if (from.cols !== state.cols || from.rows !== state.rows) {
       //: 尺寸/档位被外部改了 ⇒ 老格子按比例整块保留
       state.cells = remapCells(from, { cols: state.cols, rows: state.rows });
@@ -816,11 +825,22 @@ function buildGridCanvasWidget(node) {
     } catch (e) { /* 同步出错不能让整张图渲染挂掉 */ }
   };
 
-  /* ── 高度兜底：节点体高不够就**一次性**调够（⚠️ 绝不在 onResize 里 setSize） ── */
-  /* ⭐ 用户要求：节点在屏幕上的像素尺寸**精确 2048×2048**（创建时一次设定）。 */
-  const NODE_W_FIXED = 2048, NODE_H_FIXED = 2048;
-  function ensureNodeTallEnough() {
-    try { node.size = [NODE_W_FIXED, NODE_H_FIXED]; } catch (e) {}
+  /* ── 节点边界贴内容（2026-10-14 用户反馈"2048 固定节点太大"）：
+   * 宽度 = 自然画布宽 + 边距（node.computeSize() 不采信我们 computeSize()[0]，实测只能自己算）；
+   * 高度 = 画布行的 y + 自然行高（widget.y 要等 litegraph 排完版才有，拿不到时先保留现高，
+   * 初始化后有一次 setTimeout 补贴）。最大画布 2048×2048。用户仍可手动拖大（空白居中）/拖小（格子缩小）。
+   * ⚠️ 绝不在 onResize 里调它（onResize→setSize→onResize 无限递归，实测搞挂过工作流加载）。 ── */
+  function fitNode() {
+    try {
+      const n = naturalCanvas();
+      const w = Math.max(MIN_W, n.canvasW + 8);
+      const cw = find("grid_canvas");
+      const wy = cw && Number.isFinite(cw.y) && cw.y > 0 ? Math.round(cw.y) : 0;
+      const curH = Number(node.size && node.size[1]);
+      const h = wy > 0 ? wy + 2 + n.ch + ROW_GAP + INFO_H + 4
+        : (Number.isFinite(curH) && curH >= 200 ? Math.round(curH) : Math.round(n.ch + 320));
+      node.setSize([w, h]);
+    } catch (e) {}
   }
 
   /* 画布高度取"节点高 − 前面那些原生行占的高"的剩余值（宁可略小，**不把节点撑大**） */
@@ -831,7 +851,7 @@ function buildGridCanvasWidget(node) {
       const wy = Number.isFinite(w && w.y) ? Math.round(w.y) : 0;
       if (Number.isFinite(bh) && bh > 0) return Math.max(48, Math.round(bh) - wy - 4);
     } catch (e) {}
-    return MAX_CANVAS_H;
+    return MAX_CANVAS;
   }
 
   //: 只读调试出口：给自动化验收核对"声明的行高 == 实际绘制总高"
@@ -858,6 +878,7 @@ function buildGridCanvasWidget(node) {
       repaint();
     } catch (e) {}
   };
+  node.__gridFit = () => { try { fitNode(); } catch (e) {} };
 
   /* ── 初始化 ── */
   //: ⚠️ 顺序很重要：**先自愈坏值**，再算几何/画第一次。
@@ -865,13 +886,12 @@ function buildGridCanvasWidget(node) {
   //:    NaN 会一路传到 computeSize()，画布整块画不出来。
   healNumericWidgets();
   syncGrid();
-  ensureNodeTallEnough();   //: 高度兜底：不够就一次性调够（不在 onResize 里调）
-  //: 节点尺寸兜底：老工作流里可能是 [560, null]（NaN 被 JSON 成了 null），
-  //: null 尺寸会让 litegraph 的布局出 NaN。只在明显不合法时才动。
-  if (!Array.isArray(node.size) || !Number.isFinite(node.size[0]) || !Number.isFinite(node.size[1])
-      || node.size[0] < 200 || node.size[1] < 200) {
-    node.size = [NODE_W_FIXED, NODE_H_FIXED];
-  }
+  //: 节点边界贴内容（老工作流存的 2048 固定尺寸/坏尺寸都在这儿被收编）；
+  //: 工作流载入时 onConfigure 钩子会按载入值再贴一次。
+  fitNode();
+  //: 排版后 widget.y 才有效 ⇒ 补两次延迟贴合，把高度也收准（幂等）
+  setTimeout(() => { try { fitNode(); } catch (e) {} }, 0);
+  setTimeout(() => { try { fitNode(); } catch (e) {} }, 200);
   const nm0 = String(W("background_file", "") || "");
   if (nm0) loadBg(nm0);
   state.cells = cellsFromText(getRegionsText(), state.cols, state.rows);
@@ -896,19 +916,17 @@ app.registerExtension({
       nodeType.prototype.onConfigure = function (info) {
         try { repairLegacyWidgets(nodeData, info, this); } catch (e) {}
         const r = orig ? orig.apply(this, arguments) : undefined;
-        //: ⭐ 用户要求节点**精确 2048×2048**：老工作流里存的 size 会在 onConfigure 里覆盖掉
-        //:    创建时设的值，所以配置完成后**再钉一次**（用 setTimeout 避开本次配置流程，
-        //:    且**不是**在 onResize 里 setSize，不会递归）。顺带做载入后的画布同步
-        //:    （__gridRefresh 由 nodeCreated 里的 buildGridCanvasWidget 挂上）。
+        //: 老工作流里存的 size 会在 onConfigure 里覆盖掉当前值，所以配置完成后
+        //: 再按载入的宽高/cell 把节点边界贴回内容（用 setTimeout 避开本次配置流程，
+        //: 且**不是**在 onResize 里 setSize，不会递归）。顺带做载入后的画布同步
+        //: （__gridRefresh/__gridFit 由 nodeCreated 里的 buildGridCanvasWidget 挂上）。
         try {
           const self = this;
           setTimeout(() => {
             try {
-              if (self && self.size && (self.size[0] !== 2048 || self.size[1] !== 2048)) {
-                self.setSize([2048, 2048]);
-                self.graph && self.graph.setDirtyCanvas(true, true);
-              }
+              if (self && typeof self.__gridFit === "function") self.__gridFit();
               if (self && typeof self.__gridRefresh === "function") self.__gridRefresh();
+              self && self.graph && self.graph.setDirtyCanvas(true, true);
             } catch (e) {}
           }, 0);
         } catch (e) {}
